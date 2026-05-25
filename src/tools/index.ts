@@ -24,6 +24,7 @@ import { registerNodeBisectTools } from "./node-bisect.js";
 import { registerNodeManagementTools } from "./node-management.js";
 import { registerWorkflowDepsTools } from "./workflow-deps.js";
 import { registerInstallComfyUITools } from "./install-comfyui.js";
+import { registerUpdateComfyUITools } from "./update-comfyui.js";
 import { DefaultsManager } from "../services/defaults-manager.js";
 
 export async function registerAllTools(server: McpServer): Promise<void> {
@@ -54,5 +55,6 @@ export async function registerAllTools(server: McpServer): Promise<void> {
   registerNodeManagementTools(server);
   registerWorkflowDepsTools(server);
   registerInstallComfyUITools(server);
+  registerUpdateComfyUITools(server);
   await registerAutoloadedWorkflows(server);
 }
