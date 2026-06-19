@@ -1,13 +1,13 @@
 ---
 title: "Sidebar Panel"
-description: "ComfyUI MCP Panel — an autonomous agent in ComfyUI's sidebar that runs on your Claude subscription. No API keys. Live on ComfyUI-Manager and the Comfy Registry."
+description: "ComfyUI MCP Panel — an autonomous agent in ComfyUI's sidebar that runs on your Claude subscription. No API keys. In active development — re-releasing to the Comfy Registry soon."
 icon: "comments"
 ---
 
 <Note>
-  **✅ Live on ComfyUI-Manager & the [Comfy Registry](https://registry.comfy.org/nodes/comfyui-mcp-panel).**
-  Search **`comfyui-mcp-panel`** in ComfyUI-Manager to install. See the
-  [changelog](/changelog) for what's new.
+  **🚧 In active development.** We've temporarily pulled the panel from the Comfy
+  Registry / ComfyUI-Manager while we polish it — a re-release is coming soon. To
+  try the current build now, install it from git (see [Setup](#setup) below).
 </Note>
 
 **[comfyui-mcp-panel](https://github.com/artokun/comfyui-mcp-panel)** puts an
@@ -17,7 +17,7 @@ change — it works against your ComfyUI and replies right there. The agent runs
 session stays free.
 
 ```
-you ⇄ panel ⇄ ws://127.0.0.1:9101 (bridge) ⇄ panel orchestrator ⇄ background Claude agent (your subscription)
+you ⇄ panel ⇄ ws://127.0.0.1:9180 (bridge) ⇄ panel orchestrator ⇄ background Claude agent (your subscription)
 ```
 
 **No API keys, no per-token billing.** The agent authenticates with your on-disk
@@ -26,7 +26,7 @@ allowlist** of graph commands (no arbitrary JavaScript).
 
 ## Setup
 
-1. **Install the pack** — via ComfyUI-Manager (search `comfyui-mcp-panel`) or git:
+1. **Install the pack** from git (while we're between Registry releases):
 
    ```bash
    cd ComfyUI/custom_nodes
@@ -41,7 +41,7 @@ allowlist** of graph commands (no arbitrary JavaScript).
 
 3. **Restart ComfyUI**, open the **Agent** tab, and click **Connect**. The panel
    starts the orchestrator (`npx -y comfyui-mcp --panel-orchestrator`) on your
-   Claude subscription and links to the bridge (`ws://127.0.0.1:9101`). Type a
+   Claude subscription and links to the bridge (`ws://127.0.0.1:9180`). Type a
    request and the agent responds. **Disconnect** stops it.
 
 No `claude mcp add`, no API key. The orchestrator is started **only when you click

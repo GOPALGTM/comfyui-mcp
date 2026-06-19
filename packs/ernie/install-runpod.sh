@@ -24,11 +24,18 @@ clone "wlsh_nodes" "https://github.com/wallish77/wlsh_nodes"
 clone "comfyui-vrgamedevgirl" "https://github.com/vrgamegirl19/comfyui-vrgamedevgirl"
 clone "RES4LYF" "https://github.com/ClownsharkBatwing/RES4LYF"
 
+echo "-------- pip --------"
+PY="${PYTHON:-python3}"
+"$PY" -m pip install "librosa"
+
 echo "-------- models --------"
 grab "models/unet/ernie-image-turbo-Q8_0.gguf" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/ernie-image-turbo-Q8_0.gguf"
 grab "models/text_encoders/ministral-3-3b.safetensors" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/ministral-3-3b.safetensors"
 grab "models/text_encoders/ernie-image-prompt-enhancer.safetensors" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/ernie-image-prompt-enhancer.safetensors"
 grab "models/vae/flux2-vae.safetensors" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/flux2-vae.safetensors"
+grab "models/unet/z_image_turbo-Q8_0.gguf" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/z_image_turbo-Q8_0.gguf"
+grab "models/text_encoders/Qwen3-4B-UD-Q6_K_XL.gguf" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/Qwen3-4B-UD-Q6_K_XL.gguf"
+grab "models/vae/z-image-ae.safetensors" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/ae.safetensors"
 grab "models/upscale_models/4x-ClearRealityV1.pth" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/4x-ClearRealityV1.pth"
 grab "models/upscale_models/RealESRGAN_x4plus_anime_6B.pth" "https://huggingface.co/Aitrepreneur/FLX/resolve/main/RealESRGAN_x4plus_anime_6B.pth"
 

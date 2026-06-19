@@ -511,9 +511,6 @@ export function convertUiToApi(
     });
   }
 
-  // Build a set of node IDs for validating link targets
-  const nodeIdSet = new Set(expanded.nodes.map((n) => n.id));
-
   // Node types that are purely visual/internal and have no API equivalent
   const SKIP_TYPES = new Set(["Reroute", "Note", "PrimitiveNode", "MarkdownNote"]);
 
@@ -523,49 +520,85 @@ export function convertUiToApi(
     "SetNode_GetNode", "SetNode_SetNode",
   ]);
 
+  const nodesById = new Map(expanded.nodes.map((n) => [n.id, n]));
+
+  const isGetType = (t: string) => GET_SET_TYPES.has(t) && /get/i.test(t);
+  const isSetType = (t: string) =>
+    GET_SET_TYPES.has(t) && /set/i.test(t) && !/get/i.test(t);
+
+  // bus name (SetNode "Constant") -> the link feeding that SetNode's value input
+  const busSource = new Map<string, number>();
+  for (const n of expanded.nodes) {
+    if (!isSetType(n.type)) continue;
+    const bus = n.widgets_values?.[0];
+    const inp = (n.inputs ?? []).find((i) => i.link != null);
+    if (bus != null && inp?.link != null) busSource.set(String(bus), inp.link);
+  }
+
+  // Resolve a UI input link to a live [nodeId, slot], mirroring ComfyUI's
+  // graphToPrompt: virtual Get/Set bus nodes are resolved through to the real
+  // source; muted (mode 2) sources drop the connection; bypassed (mode 4)
+  // sources pass through — the consumer reconnects to the bypassed node's input
+  // whose type matches the requested output slot (same index first, then any
+  // type match), recursing through chains of bypassed/virtual nodes.
+  const resolveSource = (
+    linkId: number,
+    depth = 0,
+  ): { id: string; slot: number } | null => {
+    if (depth > 100) return null;
+    const link = linkMap.get(linkId);
+    if (!link) return null;
+    const src = nodesById.get(link.sourceNodeId);
+    if (!src) {
+      return { id: String(link.sourceNodeId), slot: link.sourceSlot };
+    }
+    // Virtual GetNode: follow the bus to the SetNode that wrote it.
+    if (isGetType(src.type)) {
+      const bus = src.widgets_values?.[0];
+      const setLink = bus != null ? busSource.get(String(bus)) : undefined;
+      return setLink != null ? resolveSource(setLink, depth + 1) : null;
+    }
+    // Virtual SetNode passthrough: follow its value input.
+    if (isSetType(src.type)) {
+      const inp = (src.inputs ?? []).find((i) => i.link != null);
+      return inp?.link != null ? resolveSource(inp.link, depth + 1) : null;
+    }
+    const mode = src.mode ?? 0;
+    if (mode === 0) {
+      return { id: String(link.sourceNodeId), slot: link.sourceSlot };
+    }
+    if (mode === 2) return null; // muted: connection dropped
+    if (mode === 4) {
+      // bypass: find a matching-type input to pass through
+      const outType = link.typeName;
+      const inputs = src.inputs ?? [];
+      let cand: (typeof inputs)[number] | undefined = inputs[link.sourceSlot];
+      if (!cand || cand.link == null || (outType && cand.type !== outType)) {
+        cand = inputs.find(
+          (i) => i.link != null && (!outType || i.type === outType),
+        );
+      }
+      if (!cand || cand.link == null) return null;
+      return resolveSource(cand.link, depth + 1);
+    }
+    return null;
+  };
+
   for (const node of expanded.nodes) {
+    // Muted (2) and bypassed (4) nodes are excluded from the prompt entirely;
+    // their downstream connections are rewired via resolveSource above.
+    if (node.mode === 2 || node.mode === 4) continue;
+
     const nodeId = String(node.id);
     const classType = node.type;
 
     // Skip internal litegraph node types
     if (SKIP_TYPES.has(classType)) continue;
 
-    // Determine mode status
-    const isMuted = node.mode === 2 || node.mode === 4;
-
-    // Handle Get/Set nodes specially — they're not in object_info but are
-    // important for understanding data flow. Use the node's title as the key.
-    if (GET_SET_TYPES.has(classType)) {
-      const title = node.title ?? node._meta?.title ?? "";
-      const inputs: Record<string, unknown> = {};
-
-      // For SetNode, wire the incoming connection
-      if (node.inputs) {
-        for (const input of node.inputs) {
-          if (input.link != null) {
-            const linkInfo = linkMap.get(input.link);
-            if (linkInfo && nodeIdSet.has(linkInfo.sourceNodeId)) {
-              inputs[input.name] = [String(linkInfo.sourceNodeId), linkInfo.sourceSlot];
-            }
-          }
-        }
-      }
-
-      // Store the key used for Get/Set matching
-      if (node.widgets_values && node.widgets_values.length > 0) {
-        inputs.Constant = node.widgets_values[0];
-      }
-
-      workflow[nodeId] = {
-        class_type: classType,
-        inputs,
-        _meta: { title: title || undefined },
-      };
-      if (isMuted) {
-        workflow[nodeId]._meta = { ...workflow[nodeId]._meta, mode: "muted" } as never;
-      }
-      continue;
-    }
+    // Virtual Get/Set bus nodes are not real ComfyUI nodes (not in object_info
+    // and rejected by /prompt). Drop them — resolveSource rewires consumers
+    // straight through the bus to the real upstream source.
+    if (GET_SET_TYPES.has(classType)) continue;
 
     const def = objectInfo[classType];
     if (!def) {
@@ -603,14 +636,28 @@ export function convertUiToApi(
       }
     }
 
-    // Map linked inputs from node's inputs array
+    // Fill widget inputs not covered by widgets_values (e.g. a node version added
+    // a required widget the saved graph predates) with their object_info default,
+    // so /prompt validation doesn't reject on a missing required input.
+    for (const name of widgetNames) {
+      if (name in inputs) continue;
+      const spec =
+        (def.input?.required as Record<string, unknown>)?.[name] ??
+        (def.input?.optional as Record<string, unknown>)?.[name];
+      if (!Array.isArray(spec)) continue;
+      const [type, config] = spec as [unknown, { default?: unknown }?];
+      const dflt = Array.isArray(type)
+        ? (config?.default ?? type[0]) // combo: default or first option
+        : config?.default;
+      if (dflt !== undefined) inputs[name] = dflt;
+    }
+
+    // Map linked inputs from node's inputs array (bypass/mute resolved)
     if (node.inputs) {
       for (const input of node.inputs) {
         if (input.link != null) {
-          const linkInfo = linkMap.get(input.link);
-          if (linkInfo && nodeIdSet.has(linkInfo.sourceNodeId)) {
-            inputs[input.name] = [String(linkInfo.sourceNodeId), linkInfo.sourceSlot];
-          }
+          const resolved = resolveSource(input.link);
+          if (resolved) inputs[input.name] = [resolved.id, resolved.slot];
         }
       }
     }
@@ -621,11 +668,10 @@ export function convertUiToApi(
       inputs,
     };
 
-    // Preserve title and mode metadata
+    // Preserve title metadata
     const title = node.title ?? node._meta?.title;
     const meta: Record<string, unknown> = {};
     if (title && title !== classType) meta.title = title;
-    if (isMuted) meta.mode = "muted";
     if (Object.keys(meta).length > 0) {
       workflow[nodeId]._meta = meta as { title?: string };
     }
