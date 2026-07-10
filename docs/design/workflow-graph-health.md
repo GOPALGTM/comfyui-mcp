@@ -4,6 +4,10 @@
 
 > Prior art: [filliptm/ComfyUI_FL-MCP](https://github.com/filliptm/ComfyUI_FL-MCP) `workflow_overview` (`web/js/query_executor.js`) reports node-type histograms, disconnected nodes, and missing required inputs — but client-side with slot-name heuristics, because the live canvas lacks schema data. We run server-side with real `/object_info` required/optional data, keeping their heuristics only as a fallback for uninstalled node types.
 
+## Relationship to graph query (#169)
+
+`query_workflow` / `panel_query_graph` (comfyui-mcp #179 + panel #77) is the *generic* surface — arbitrary filter/traverse/aggregate over a graph, agent-composed per question. Graph health is the *curated* counterpart: a fixed set of opinionated findings (disconnected, missing-required, duplicate loads, orphaned branches, muted/bypassed) with severities and remediation hints, computed server-side against `/object_info`. Health does not duplicate query capability; anything beyond these findings should be answered with the query tools rather than by growing this list.
+
 ## Motivation
 
 `validate_workflow` (`src/tools/workflow-validate.ts` → `src/services/workflow-validator.ts`) catches hard errors: unknown node types, missing required inputs, broken/self-referencing links, invalid output indices, out-of-list combo values. `analyze_workflow` (`src/tools/workflow-library.ts:409-509`) explains *structure*. Neither answers "is this graph *healthy*": dead subgraphs, duplicate model loads wasting VRAM, sampler branches whose outputs never reach a save node, or muted/bypassed nodes silently dropping connections.

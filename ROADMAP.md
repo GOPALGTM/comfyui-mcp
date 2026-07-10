@@ -160,9 +160,10 @@ Declarative per-category safety gates (workflow-writes, model-deletes, process-c
 shared/untrusted deployments, structured `DISABLED_BY_CONFIG` refusals agents can self-correct
 from, and a `capability_audit` tool reporting gate + environment state. Full design already
 specced: [`design/safety-gates.md`](https://github.com/artokun/comfyui-mcp/blob/spec/safety-gates/docs/design/safety-gates.md)
-(spec PR #172, closed unmerged; prior discussion in issue #168). Deferred — we're not serving
-shared/enterprise deployments yet; revive the spec branch when a customer or hosting story needs
-it. Until then, isolated write-risk tools ship with narrow inline env flags (e.g.
+(spec PR #172, closed unmerged). **Closed as won't-do in issue #168**: comfyui-mcp's deployment
+reality is single-user (own panel, own box/pod), permissive-by-default is correct, and we don't
+build gate systems on spec for a shared/enterprise story that doesn't exist. This theme exists
+purely to keep the design findable if that reality ever changes. Until then, isolated write-risk tools ship with narrow inline env flags (e.g.
 `COMFYUI_MCP_ALLOW_GIT_WRITES`) that Theme G will absorb.
 
 ---

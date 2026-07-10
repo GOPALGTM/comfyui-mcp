@@ -39,7 +39,7 @@ Result/error shapes are defined by the paired RFC (`{applied, columns, moved[], 
 
 ## Gating
 
-Ships ungated, exactly like the other mutating panel tools today (`panel_move_node`, `panel_add_node`, …). Safety gates were deferred: the `panel-writes` gate / spec PR #172 was closed and the work moved to [ROADMAP.md](../../ROADMAP.md) Theme G — when gates land they'll cover `panel_auto_layout` alongside the rest of the mutating panel surface.
+Ships ungated, exactly like the other mutating panel tools today (`panel_move_node`, `panel_add_node`, …). Safety gates were closed as won't-do (issue #168; spec PR #172 closed, design archived under ROADMAP Theme G).
 
 ## Implementation plan
 

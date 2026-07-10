@@ -2,9 +2,9 @@
 
 **Status:** implemented (this PR)
 
-> **Safety-gates note:** The original design depended on a general safety-gates framework (spec PR #172), which was closed — a gates framework is deferred to **ROADMAP Theme G**. This PR therefore ships without gates: `write_node_file` / `apply_node_patch` are UNGATED (like the other mutating tools in this repo today), and `node_pack_git commit`/`push` are guarded by a single narrow inline env flag, `COMFYUI_MCP_ALLOW_GIT_WRITES` (`"1"`/`"true"`; default OFF). When off, commit/push return an `isError` result with the structured `DISABLED_BY_CONFIG` body (`{ "error": "DISABLED_BY_CONFIG", "disabled_by_config": true, "required_flag": "COMFYUI_MCP_ALLOW_GIT_WRITES=1", "message": … }`); `status`/`diff`/`log` are always allowed. Theme G's gates framework will absorb this flag. Wherever the text below says "gated `node-writes`"/"gated `git-writes`", read it as: node-writes → ungated; git-writes → the `COMFYUI_MCP_ALLOW_GIT_WRITES` flag.
+> **Safety-gates note:** The original draft depended on a general safety-gates framework (spec PR #172). That framework was **rejected as won't-do** — see issue #168's closing rationale: comfyui-mcp's deployment reality is single-user (own panel, own box/pod), so permissive-by-default is correct and we are not building a gate system on spec (ROADMAP Theme G records the thinking should a shared-deployment need ever materialize). The **path jail is not a gate feature** — it is an inherent boundary of these tools and stands on its own. Beyond it: `write_node_file` / `apply_node_patch` are UNGATED (like the other mutating tools in this repo today), and `node_pack_git commit`/`push` are guarded by a single narrow inline env flag, `COMFYUI_MCP_ALLOW_GIT_WRITES` (`"1"`/`"true"`; default OFF). When off, commit/push return an `isError` result with the structured `DISABLED_BY_CONFIG` body (`{ "error": "DISABLED_BY_CONFIG", "disabled_by_config": true, "required_flag": "COMFYUI_MCP_ALLOW_GIT_WRITES=1", "message": … }`); `status`/`diff`/`log` are always allowed. The flag exists because push has off-machine effects, not as a placeholder for a gate system. Wherever the text below says "gated `node-writes`"/"gated `git-writes`", read it as: node-writes → ungated; git-writes → the `COMFYUI_MCP_ALLOW_GIT_WRITES` flag.
 
-> Prior art: [filliptm/ComfyUI_FL-MCP](https://github.com/filliptm/ComfyUI_FL-MCP) `backend/coding_tools.py` — file read/search/write/patch/git tools hard-jailed to `custom_nodes/` with bounded output. We port the shape and the output-bounding constants, and add Windows symlink/junction safety, gate integration, and reuse of our existing containment code.
+> Prior art: [filliptm/ComfyUI_FL-MCP](https://github.com/filliptm/ComfyUI_FL-MCP) `backend/coding_tools.py` — file read/search/write/patch/git tools hard-jailed to `custom_nodes/` with bounded output. We port the shape and the output-bounding constants, and add Windows symlink/junction safety, and reuse of our existing containment code.
 
 ## Motivation
 
@@ -63,7 +63,7 @@ function resolveInJail(relOrAbs: string): { abs: string; rel: string }
 ## Integration with existing flows
 
 - Tool descriptions cross-reference the closed loop (scaffold → write/patch → verify → restart → commit → publish); `fix_custom_node` and the bisect tools mention the diagnose-then-patch follow-up in their descriptions (descriptions are the agent UX).
-- Compact router: a new `["custom-nodes", registerNodeDevTools]` entry appended to `TOOL_GROUPS` is captured by `collectToolCatalog` automatically, and `searchCorpus` (`compact.ts:35-40`) indexes the param descriptions, so `list_tools search:"patch"` finds it. Gates apply identically because the gates wrapper sits before the catalog.
+- Compact router: a new `["custom-nodes", registerNodeDevTools]` entry appended to `TOOL_GROUPS` is captured by `collectToolCatalog` automatically, and `searchCorpus` (`compact.ts:35-40`) indexes the param descriptions, so `list_tools search:"patch"` finds it. The `COMFYUI_MCP_ALLOW_GIT_WRITES` check lives in the handler, so it applies identically through the compact router.
 
 ## Implementation plan
 
@@ -80,11 +80,11 @@ function resolveInJail(relOrAbs: string): { abs: string; rel: string }
 - **read/list bounding:** line-range math, char-truncation notice, long-line chunking, `total_lines` on CRLF files.
 - **search:** builtin fallback correctness + caps; ripgrep path via exec seam; binary/large-file skip.
 - **patch:** temp git-repo fixture — clean apply; check-stage failure surfaces stderr; patch touching a path outside `custom_nodes` refused **before** any git call.
-- **git:** seam-mocked exec asserting exact argv (no option injection); commit requires message; commit/push return the gates refusal when `git-writes` closed.
+- **git:** seam-mocked exec asserting exact argv (no option injection); commit requires message; commit/push return the `DISABLED_BY_CONFIG` refusal when `COMFYUI_MCP_ALLOW_GIT_WRITES` is unset.
 - **Integration (opt-in, `COMFYUI_INTEGRATION=true`):** scaffold → write → verify → git status roundtrip in a temp workspace.
 
 ## Rollout / compat
 
-- Six new tools appended; no existing tool changes. Reads work day one; writes honor SAFE_MODE; `node_pack_git commit/push` require explicit `COMFYUI_MCP_ALLOW_GIT_WRITES=1` — safe-by-default for the only genuinely new blast radius.
+- Six new tools appended; no existing tool changes. Reads work day one; writes are ungated by design (single-user deployment reality, see #168); `node_pack_git commit/push` require explicit `COMFYUI_MCP_ALLOW_GIT_WRITES=1` — safe-by-default for the only genuinely new blast radius.
 - Remote/cloud modes: all six refuse cleanly (no `comfyuiPath`), consistent with node-authoring's LOCAL-ONLY contract.
-- Ships independently: the safety-gates framework is deferred to ROADMAP Theme G, which will later absorb the narrow `COMFYUI_MCP_ALLOW_GIT_WRITES` flag introduced here.
+- Ships independently: no gate-system dependency (safety gates closed as won't-do per issue #168; ROADMAP Theme G archives the design).

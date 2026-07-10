@@ -38,7 +38,7 @@ No result-shape change agent-side (the panel's result JSON — now possibly carr
 
 ## Gating
 
-`panel_connect` is a panel-write; DSL warnings are read-only advisory output — ungated. There is no runtime gating change in this PR: the safety-gates taxonomy (spec PR #172) was closed, and gate enforcement is deferred to ROADMAP Theme G.
+`panel_connect` is a panel-write; DSL warnings are read-only advisory output — ungated. There is no runtime gating in this PR: safety gates were closed as won't-do (issue #168; spec PR #172 closed, design archived under ROADMAP Theme G).
 
 ## Test plan
 
