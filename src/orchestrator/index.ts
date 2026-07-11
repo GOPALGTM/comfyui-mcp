@@ -592,6 +592,11 @@ const CALL_TOOL_WHITELIST = new Set<string>([
   "download_civitai_model",
   "download_model",
   "enqueue_workflow",
+  // Persist a workflow to the ComfyUI library (mobile "pull workflow from a
+  // CivitAI example" → save_workflow). Writes a workflow file (auto-converts
+  // API-format graphs to canvas-openable UI format); overwrites same-filename,
+  // so the client generates a unique name. No model/system mutation.
+  "save_workflow",
 ]);
 
 /** Lazily build ONE in-process MCP client wired to the full comfyui tool surface,
