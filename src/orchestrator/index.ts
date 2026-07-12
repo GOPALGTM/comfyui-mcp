@@ -22,6 +22,7 @@ import { startQuickTunnel } from "../services/tunnel.js";
 import { detectInstallMode } from "../services/self-update.js";
 import { SessionStore } from "./session-store.js";
 import { listSessions, loadTranscript } from "./history.js";
+import { uploadImageHttp } from "../comfyui/client.js";
 import { logger } from "../utils/logger.js";
 import {
   PanelAgentManager,
@@ -2388,6 +2389,43 @@ export async function runPanelOrchestrator(): Promise<void> {
             tabId,
           );
         });
+      return;
+    }
+
+    // Media upload from the mobile client: the phone sends image/video bytes
+    // (base64) to stage as a ComfyUI INPUT (LoadImage / VHS_LoadVideo), since the
+    // phone can't reach the rig's filesystem. Decode → POST to ComfyUI's
+    // /upload/image → reply with the stored input filename the agent can use.
+    if (event.type === "upload_media" && event.tab_id) {
+      const tabId = event.tab_id;
+      const ev = event as {
+        cid?: unknown;
+        filename?: unknown;
+        mime?: unknown;
+        data_base64?: unknown;
+      };
+      const cid = typeof ev.cid === "string" ? ev.cid : undefined;
+      const filename = typeof ev.filename === "string" ? ev.filename : "upload";
+      const mime = typeof ev.mime === "string" ? ev.mime : "image/png";
+      const b64 = typeof ev.data_base64 === "string" ? ev.data_base64 : "";
+      void (async () => {
+        try {
+          if (!b64) throw new Error("no data");
+          const buf = Buffer.from(b64, "base64");
+          const res = await uploadImageHttp(filename, buf, mime);
+          bridge.push(
+            { type: "media_uploaded", cid, ok: true, name: res.name, kind: mime.startsWith("video") ? "video" : "image" },
+            tabId,
+          );
+          logger.info(`[panel-orchestrator] upload_media → ${res.name} (${buf.length}B, tab ${tabId.slice(0, 8)})`);
+        } catch (err) {
+          logger.warn(`[panel-orchestrator] upload_media failed: ${err}`);
+          bridge.push(
+            { type: "media_uploaded", cid, ok: false, error: err instanceof Error ? err.message : String(err) },
+            tabId,
+          );
+        }
+      })();
       return;
     }
 
