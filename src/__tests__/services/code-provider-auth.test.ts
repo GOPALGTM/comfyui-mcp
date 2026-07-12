@@ -120,3 +120,69 @@ describe("resolveKimiCodeOAuth", () => {
     expect(saved.access_token).toBe("fresh-kimi");
   });
 });
+describe("nativeCliStatus (CLI-auth detection for oauth_status)", () => {
+  let home = "";
+
+  beforeEach(async () => {
+    home = await mkdtemp(join(tmpdir(), "cli-status-test-"));
+  });
+
+  afterEach(async () => {
+    if (home) await rm(home, { recursive: true, force: true });
+  });
+
+  const jwt = (claims: Record<string, unknown>) =>
+    `hdr.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.sig`;
+
+  it("detects an existing codex CLI login (email from id_token, '(CLI)' suffix)", async () => {
+    const dir = join(home, ".codex");
+    await mkdir(dir, { recursive: true });
+    const exp = Math.floor(Date.now() / 1000) + 3600;
+    await writeFile(
+      join(dir, "auth.json"),
+      JSON.stringify({
+        auth_mode: "chatgpt",
+        tokens: {
+          access_token: jwt({ exp }),
+          refresh_token: "rt-1",
+          id_token: jwt({ email: "dev@example.com" }),
+        },
+      }),
+    );
+    const rec = __testing.nativeCliStatus("codex", home);
+    expect(rec).not.toBeNull();
+    expect(rec!.provider).toBe("codex");
+    expect(rec!.account_label).toBe("dev@example.com (CLI)");
+    // refresh token present → no expiry pinned (CLI renews indefinitely)
+    expect(rec!.expires_at).toBeUndefined();
+  });
+
+  it("returns null when there is no auth file", () => {
+    expect(__testing.nativeCliStatus("codex", home)).toBeNull();
+  });
+
+  it("returns null for an expired access-only token (no refresh)", async () => {
+    const dir = join(home, ".codex");
+    await mkdir(dir, { recursive: true });
+    const exp = Math.floor(Date.now() / 1000) - 3600;
+    await writeFile(
+      join(dir, "auth.json"),
+      JSON.stringify({ tokens: { access_token: jwt({ exp }) } }),
+    );
+    expect(__testing.nativeCliStatus("codex", home)).toBeNull();
+  });
+
+  it("detects flat-shape files (grok) and never returns token material", async () => {
+    const dir = join(home, ".grok");
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      join(dir, "auth.json"),
+      JSON.stringify({ access_token: "opaque-token-abc", refresh_token: "rt-2" }),
+    );
+    const rec = __testing.nativeCliStatus("grok", home);
+    expect(rec).not.toBeNull();
+    expect(rec!.account_label).toBe("CLI session");
+    expect(JSON.stringify(rec)).not.toContain("opaque-token-abc");
+    expect(JSON.stringify(rec)).not.toContain("rt-2");
+  });
+});

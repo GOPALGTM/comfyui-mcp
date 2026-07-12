@@ -1,5 +1,5 @@
 import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, rmSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -622,9 +622,65 @@ export async function persistOAuthResult(
   return { account_label: accountLabel };
 }
 
-/** All in-panel OAuth sign-ins' status (for the UI) — status only, never tokens. */
+/**
+ * Best-effort: synthesize a status record from a provider's NATIVE CLI auth
+ * file when the panel mirror has none — e.g. the user ran `codex login` (or
+ * grok's CLI auth) long before the panel existed. Without this the credentials
+ * card shows "Sign in with ChatGPT (Codex)" to someone who is already signed
+ * in, pushing a pointless second login. Status only — token material is read
+ * to derive a label/expiry and never returned.
+ */
+function nativeCliStatus(providerId: string, home = homedir()): OAuthStatusRecord | null {
+  const path = nativeTokenFilePath(providerId, home);
+  if (!path || !existsSync(path)) return null;
+  try {
+    const raw = JSON.parse(readFileSync(path, "utf8")) as {
+      tokens?: { access_token?: string; refresh_token?: string; id_token?: string };
+      access_token?: string;
+      refresh_token?: string;
+      id_token?: string;
+    };
+    // codex nests under `tokens`; grok/copilot are flat.
+    const tokens = raw.tokens ?? raw;
+    const access = tokens.access_token?.trim();
+    const refresh = tokens.refresh_token?.trim();
+    if (!access && !refresh) return null;
+    // A refresh token means the CLI can renew indefinitely — treat as signed in
+    // even if the current access token is stale. Access-only: honor its exp.
+    const expMs = access ? jwtExpMs(access) : null;
+    if (!refresh && expMs !== null && expMs <= Date.now()) return null;
+    const email = jwtEmailClaim(tokens.id_token);
+    const obtained = (() => {
+      try {
+        return statSync(path).mtimeMs;
+      } catch {
+        return Date.now();
+      }
+    })();
+    return {
+      provider: providerId,
+      account_label: email ? `${email} (CLI)` : "CLI session",
+      obtained_at: Math.round(obtained),
+      ...(refresh || expMs === null ? {} : { expires_at: expMs }),
+      ...(providerId === "copilot" ? { experimental: true } : {}),
+    };
+  } catch {
+    return null; // unreadable/foreign file shape — stay silent, never block status
+  }
+}
+
+/** All in-panel OAuth sign-ins' status (for the UI) — status only, never tokens.
+ *  Merges the panel mirror with DETECTED native CLI auth (mirror wins) so a
+ *  CLI-authenticated provider never asks the user to sign in a second time. */
 export function readOAuthStatus(): OAuthStatusRecord[] {
-  return listOAuthStatus();
+  const mirror = listOAuthStatus();
+  const seen = new Set(mirror.map((r) => r.provider));
+  for (const providerId of ["codex", "grok", "copilot"]) {
+    if (seen.has(providerId)) continue;
+    const detected = nativeCliStatus(providerId);
+    if (detected) mirror.push(detected);
+  }
+  return mirror;
 }
 
 /** Sign a provider out: deletes its native token file (best-effort) and the
@@ -637,6 +693,7 @@ export function clearOAuth(providerId: string, deps: CodeProviderAuthDeps = {}):
 }
 
 export const __testing = {
+  nativeCliStatus,
   OPENAI_CODEX_CLIENT_ID,
   KIMI_CODE_CLIENT_ID,
   GLM_CODE_DEFAULT_BASE,
