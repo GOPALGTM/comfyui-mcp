@@ -53,9 +53,19 @@ import {
 } from "../services/panel-secrets.js";
 import { CodexBackend } from "./codex-backend.js";
 import { GeminiBackend, GEMINI_DEFAULT_MODEL } from "./gemini-backend.js";
-import { OllamaBackend } from "./ollama-backend.js";
+import { GrokBackend, GROK_DEFAULT_MODEL } from "./grok-backend.js";
+import { OllamaBackend, OLLAMA_SYSTEM_PROMPT } from "./ollama-backend.js";
+import { ChatGptOAuthBackend, CHATGPT_DEFAULT_MODEL } from "./chatgpt-oauth-backend.js";
+import { GlmBackend, GLM_DEFAULT_MODEL } from "./glm-backend.js";
+import { KimiBackend, KIMI_DEFAULT_MODEL } from "./kimi-backend.js";
+import { CopilotBackend, COPILOT_DEFAULT_MODEL } from "./copilot-backend.js";
+import { SYSTEM as MODEL_CARD_SYSTEM } from "./ai-proposer.js";
+import { resolvePrompt, registerPrompt, onPromptsChanged } from "../services/prompt-overrides.js";
 import { allBackendReadiness } from "./backend-readiness.js";
+import { handleOAuthBegin, handleOAuthStatus, handleOAuthSignout } from "./oauth-bridge.js";
+import { OAUTH_PROVIDERS } from "../services/oauth-flow.js";
 import { startPanelMcpHttpServer, type PanelMcpHttpServer } from "./panel-mcp-http.js";
+import { startPanelConsoleHttpServer, type PanelConsoleHttpServer } from "./panel-console-http.js";
 import type { AgentBackend } from "./agent-backend.js";
 import { readComfyuiCrashLog, formatCrashNote } from "../services/crash-log.js";
 import { QueueMonitor, type StallReport } from "../services/queue-monitor.js";
@@ -73,10 +83,13 @@ import {
   buildPanelSystemAppend,
   type EnvCapabilities,
 } from "../services/env-capabilities.js";
+import { WorkflowTargetStore } from "../services/workflow-target-store.js";
 
 const PANEL_SYSTEM_APPEND = `You are the autonomous assistant embedded directly in a ComfyUI sidebar panel. The person is working in ComfyUI and talks to you through that panel: their messages arrive as your prompts, and everything you write is shown to them in the panel chat. Write for that reader — lead with the result, keep replies short and concrete, and don't narrate routine internal steps.
 
 You can SEE and EDIT the workflow the user currently has open, via the panel_* tools (panel_graph_outline, panel_query_graph, panel_add_node, panel_connect, panel_set_widget, panel_run, panel_get_errors, panel_save_workflow, …). STRONGLY PREFER building on their live canvas: read it first (panel_graph_outline, then panel_query_graph for specifics), add/wire/configure nodes with the panel_* tools, then panel_run to queue it — so the user watches the work happen and the result loads in their own workflow with full Ctrl+Z undo. Only fall back to the headless generate_image/enqueue_workflow tools when the user explicitly wants a one-off they don't need on their canvas, or when no panel tab is connected (a panel_* call will error if so). On a LARGE graph (a loaded pack/template with dozens of nodes), do NOT dump the whole thing and scan it — and NEVER shell out to grep/jq/python over a saved workflow file. To UNDERSTAND the graph, call panel_graph_outline FIRST: a compact, dependency-ordered TEXT map (nodes topologically sorted source→sink, each with its key widgets and ← inputs / → outputs wiring, plus a groups index) made for you to read top-to-bottom. To PINPOINT and INSPECT specific nodes, use panel_query_graph: filter by types/title/widget predicates ('cfg>7'), traverse upstream_of/downstream_of a node, aggregate with group_by:'type', and read ONE node's exact slot/widget detail with {ids:[id], fields:'detail'} — output is token-bounded so it can never flood your context. panel_find_nodes remains for free-text search across all fields.
+
+PROMPT DIRECTOR AWARENESS. When the graph contains PromptDirector, PromptDirectorAuto, PromptDirectorContext, PromptProducer, or PromptDirectorResultCritic nodes, call panel_audit_prompt_director before declaring that the prompt/model/LoRA setup is correct or diagnosing a failed edit. The audit correlates live wiring and loader widgets with the nodes' resolved Model Explorer metadata, edit plan, LoRA compatibility/strengths, exact final prompt, warnings, and critic verdict. Surface concise, useful observations proactively (including when the configuration is coherent). Its recommendations are READ-ONLY proposals: ask before applying panel_set_widget/panel_connect changes unless the user already explicitly asked you to fix the workflow.
 
 TRUST REPORTED MANUAL CHANGES. The user can edit the canvas BY HAND between your turns (bypass/mute a node, change a widget, rewire, add/remove nodes). When that happens, your turn opens with a "⟳ MANUAL CANVAS CHANGES since your last turn" block listing exactly what they changed. Treat that block as GROUND TRUTH about the current graph — it overrides what you remember from earlier in the conversation. Do NOT assume the graph still matches your last edit or your earlier reading; if the listed changes are substantial (or contradict a plan you were mid-execution on), re-read with panel_graph_outline before you act or draw conclusions. This is also how you learn the user already tried something (e.g. they bypassed a node and it worked) — believe it over your own prior reasoning.
 
@@ -87,6 +100,8 @@ If a workflow needs a custom node the user doesn't have, don't silently skip it 
 CRASH RECOVERY — when a custom node BREAKS or CRASHED ComfyUI, fix it before giving up. If your turn begins with a "⚠️ ComfyUI crashed …" note (it names the fatal log block and the most likely culprit custom node + file:line), or a run dies with a node-level error you can pin to one pack, do NOT just re-run the same graph — ESCALATE to actually fix that node, narrating each step to the user as you go: (a) UPDATE it to the latest code — call panel_update_node with the culprit's id (or the comfyui MCP update_custom_node / fix_custom_node). Try version 'nightly' to grab a just-landed upstream fix. Poll panel_node_queue_status, then panel_restart_comfyui → you resume and RETRY the action to see if the crash is gone. (b) If updating doesn't fix it, reach into COMFYUI_PATH/custom_nodes/<NodeDir> with your shell (Bash): if it's a git repo (a .git dir), run git fetch && git pull (or check out the nightly branch) to force the latest, reinstall its requirements if needed, then restart + retry. (c) If there's no git or it's still broken, attempt a TARGETED source patch of the crashing file:line, then VERIFY the fix actually resolves the crash (restart + retry the same action — confirm it no longer faults). Once verified, OFFER to suggest the fix upstream to the repo owner (open an issue or PR describing the crash + your patch) — describe it and ask the user first; do NOT auto-file anything. Combine this cleanly with the normal install→restart→continue flow above: a fresh install that crashes on first use is the same loop (update/patch the just-installed node, don't abandon it).
 
 WEDGED RENDER / OOM / VRAM PINNED — when a generation is stuck or hits CUDA out-of-memory, or a cancel didn't actually free GPU memory (models still resident, VRAM pinned, the next run still OOMs), call panel_free_vram to UNLOAD all models and free VRAM before retrying — it does NOT restart ComfyUI, so it's the cheap first move. Escalation ladder: cancel the run → panel_free_vram (unload + free) → retry; only as a LAST RESORT panel_restart_comfyui (which refuses mid-render and guards the running generation). Reach for panel_free_vram before a restart whenever a cancel left memory pinned.
+
+WORKFLOW TARGETING — by default your panel_* graph edits follow whichever workflow tab the user is currently viewing. If the user wants you to work on a DIFFERENT open workflow while they browse another tab, call panel_set_workflow_target(mode:"pinned", path:<from panel_list_workflows>) to pin edits to that workflow; panel_get_workflow_target shows the current binding. Set mode:"current" to follow the user's active tab again. Pinning does NOT switch what the user sees — it only routes your graph tools. When pinned, still use panel_open_workflow only when you intentionally want to switch the user's view.
 
 CRITICAL — never destroy the user's work. When they ask for a "new workflow", a "fresh canvas", or to "start over for a new project", call panel_new_workflow (it opens a NEW TAB and leaves their current workflow intact). NEVER use panel_clear for that — panel_clear wipes the CURRENTLY OPEN graph and is ONLY for an explicit "clear/reset this canvas". You can manage tabs with panel_list_workflows / panel_open_workflow / panel_rename_workflow / panel_close_workflow, and group nodes with panel_select_nodes / panel_create_subgraph. To label a node by its purpose, use panel_set_node_title. To read or edit nodes INSIDE a subgraph, call panel_enter_subgraph(node_id) first — then panel_query_graph / panel_graph_outline and the panel_* edit tools operate on the subgraph's inner nodes — and panel_exit_subgraph when you're done.
 
@@ -132,7 +147,15 @@ DEBUG WRONG RENDERS BY INSPECTING INTERMEDIATE STEPS (run-to-node). When a final
 
 CHAIN A STAGE'S OUTPUT INTO THE NEXT STAGE'S LOADER — when a multi-stage pipeline (e.g. Krea2 image → LTX video → WAN extend) needs one stage's OUTPUT fed into the next stage's loader (LoadImage / VHS_LoadVideo / LoadAudio), call stage_output_as_input with the output's { filename, subfolder?, type? } and drop the returned input filename into the loader's image/video/audio widget. (Or, for a file already on disk, upload_image / upload_video / upload_audio.) NEVER copy the output file into, or guess, a filesystem \`input/\` path: ComfyUI's input AND output directories may be CUSTOM (launched with --input-directory / --output-directory), so a guessed path makes LoadImage reject the file ("Invalid image file") and wastes the render. stage_output_as_input goes through the server API (/view → /upload/image), which resolves the real dirs correctly every time. VERIFY A VIDEO RENDER VIA THE FILESYSTEM, NOT /history — VHS_VideoCombine and similar video nodes write the .mp4 but frequently do NOT register an output in ComfyUI's /history (the prompt shows done with no output and no error), so do NOT conclude a clip "silently dropped" from get_history/get_job_status; confirm it with list_output_images (which now lists videos, each tagged kind:"video") by filename/prefix + fresh mtime, then chain it forward with stage_output_as_input.
 
-BYPASS COMPLETED STAGES BEFORE QUEUING THE NEXT ONE. When you build a multi-stage pipeline on one canvas (e.g. Krea2 → LTX → WAN), once a stage has RUN and you've captured/staged its output, BYPASS that stage's nodes with panel_set_node_mode(mode:"bypass") BEFORE you queue the next stage — so panel_run doesn't re-execute (and make the user pay for / wait on) work that's already done. Re-running the whole graph because an earlier stage was left active is a real, costly failure mode: explicitly bypass each finished stage and keep only the ACTIVE stage live. (This complements stage_output_as_input, which feeds the prior stage's output forward into the next stage's loader — bypass the producer, feed its captured output to the consumer.)`;
+BYPASS COMPLETED STAGES BEFORE QUEUING THE NEXT ONE. When you build a multi-stage pipeline on one canvas (e.g. Krea2 → LTX → WAN), once a stage has RUN and you've captured/staged its output, BYPASS that stage's nodes with panel_set_node_mode(mode:"bypass") BEFORE you queue the next stage — so panel_run doesn't re-execute (and make the user pay for / wait on) work that's already done. Re-running the whole graph because an earlier stage was left active is a real, costly failure mode: explicitly bypass each finished stage and keep only the ACTIVE stage live. (This complements stage_output_as_input, which feeds the prior stage's output forward into the next stage's loader — bypass the producer, feed its captured output to the consumer.)
+
+## Interactive UI cards
+When the user must choose between options, confirm a plan, fill in parameters, or would grasp a wiring explanation faster as a diagram, render a CARD instead of a wall of text: call panel_ui_render with an A2UI-subset spec (choice Buttons; forms from TextField/Select/Checkbox plus one submit Button; 'comfy:graph' for node-wiring diagrams — give nodes and edges, the panel draws it; 'comfy:chart' for bar/line comparisons). After rendering a card that asks a question, END YOUR TURN — the user's click arrives as their next chat message. Use panel_ui_update(card_id, spec) to update a live card in place (progress, revised options). Set surface:"wide" only for diagram-heavy cards. Keep cards small: one decision per card, ≤5 buttons, plain language labels.
+If you do NOT have panel_ui_render (no panel tools), you may emit the same JSON spec in a fenced block instead:
+\`\`\`a2ui
+{ "root": "c", "components": [ ... ] }
+\`\`\`
+Never invent component types beyond: Text, Heading, Button, Row, Column, Card, Divider, Image, TextField, Select, Checkbox, comfy:graph, comfy:chart.`;
 
 /**
  * The panel auto-sends one of a few fixed "resume" nudges after ComfyUI restarts
@@ -957,6 +980,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   // COMFYUI_MCP_GEMINI_MODEL (default gemini-2.5-pro). The model is applied at spawn
   // via the CLI `--model` flag (ACP exposes no per-session model setter).
   const geminiModel = process.env.COMFYUI_MCP_GEMINI_MODEL ?? GEMINI_DEFAULT_MODEL;
+  const grokModel = process.env.COMFYUI_MCP_GROK_MODEL ?? GROK_DEFAULT_MODEL;
   // Ollama (local LLMs, issue #97): the model is a local tag applied PER
   // REQUEST — switching live is free. Default = OUR FINE-TUNE,
   // artokun/gemma4-comfyui-mcp:e4b — gemma4 QLoRA-trained on 1055
@@ -978,6 +1002,13 @@ export async function runPanelOrchestrator(): Promise<void> {
   const persistedAgent = getAgentSettings();
   let ollamaModel =
     process.env.COMFYUI_MCP_OLLAMA_MODEL ?? persistedAgent.ollama?.model ?? "artokun/gemma4-comfyui-mcp:e4b";
+  const chatgptModel = process.env.COMFYUI_MCP_CHATGPT_MODEL ?? CHATGPT_DEFAULT_MODEL;
+  const glmModel = process.env.COMFYUI_MCP_GLM_MODEL ?? GLM_DEFAULT_MODEL;
+  const kimiModel = process.env.COMFYUI_MCP_KIMI_MODEL ?? KIMI_DEFAULT_MODEL;
+  // EXPERIMENTAL (ToS risk) — off by default, only reachable once the user has
+  // signed in via the panel's experimental row (oauth-bridge.ts's
+  // allow_experimental gate); never the defaultBackend/auto-pick.
+  const copilotModel = process.env.COMFYUI_MCP_COPILOT_MODEL ?? COPILOT_DEFAULT_MODEL;
   // The same backend also speaks any OpenAI-compatible endpoint (OpenRouter,
   // DeepSeek, vLLM, LM Studio): COMFYUI_MCP_OLLAMA_API=openai +
   // COMFYUI_MCP_OLLAMA_BASE_URL (incl. /v1) + COMFYUI_MCP_OLLAMA_API_KEY
@@ -1065,11 +1096,26 @@ export async function runPanelOrchestrator(): Promise<void> {
   // provider (the panel replays the transcript to seed it) while a same-provider
   // reconnect RESUMES. `backendId`/`codexModel`/`geminiModel` above are the
   // DEFAULT + per-provider model config; the process is no longer pinned to one.
-  const KNOWN_BACKENDS = new Set(["claude", "codex", "gemini", "ollama", "openrouter", "lmstudio", "llamacpp", "custom"]);
+  const KNOWN_BACKENDS = new Set([
+    "claude",
+    "codex",
+    "chatgpt",
+    "gemini",
+    "grok",
+    "glm",
+    "kimi",
+    "ollama",
+    "openrouter",
+    "lmstudio",
+    "llamacpp",
+    "custom",
+    "copilot", // EXPERIMENTAL — see copilotModel's comment above
+  ]);
   const defaultBackend = KNOWN_BACKENDS.has(backendId) ? backendId : "claude";
   const AGENT_KEY_SEP = "::";
   const tabBackends = new Map<string, string>(); // panel tabId -> selected backend
   const headlessTabs = new Set<string>(); // tabs with no ComfyUI canvas (mobile/remote) — deliver renders in-turn
+  const workflowTargets = new WorkflowTargetStore();
   const backendForTab = (panelTabId: string): string =>
     tabBackends.get(panelTabId) ?? defaultBackend;
   const agentKeyFor = (panelTabId: string): string =>
@@ -1095,7 +1141,7 @@ export async function runPanelOrchestrator(): Promise<void> {
   // just the static text (no env block). Built once; refreshed after a ComfyUI
   // restart/reconnect via refreshEnvCapabilities() below.
   let envCaps: EnvCapabilities | undefined;
-  let panelSystemAppend = PANEL_SYSTEM_APPEND;
+  let panelSystemAppend = resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND);
   // Set once the manager exists so a later refresh (after a ComfyUI restart) feeds
   // the freshly-gathered env into newly-spawned agents too — Claude reads
   // manager.opts.systemAppend at each spawn; Codex reads the closed-over
@@ -1105,12 +1151,12 @@ export async function runPanelOrchestrator(): Promise<void> {
   async function refreshEnvCapabilities(): Promise<void> {
     try {
       envCaps = await gatherEnvCapabilities({ comfyuiUrl, comfyuiPath, backendId });
-      panelSystemAppend = buildPanelSystemAppend(PANEL_SYSTEM_APPEND, envCaps);
+      panelSystemAppend = buildPanelSystemAppend(resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND), envCaps);
       if (liveManager) liveManager.setSystemAppend(panelSystemAppend);
     } catch (err) {
       // Belt-and-suspenders: gather is internally guarded, but never let a stray
       // throw break the prompt — fall back to the static append.
-      panelSystemAppend = PANEL_SYSTEM_APPEND;
+      panelSystemAppend = resolvePrompt("panel.persona", PANEL_SYSTEM_APPEND);
       logger.debug(
         `[panel-orchestrator] env-capabilities probe failed (using static prompt): ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -1119,6 +1165,15 @@ export async function runPanelOrchestrator(): Promise<void> {
   // Build it before any agent could spawn. Guarded so a probe stall can't block
   // orchestrator startup beyond the probes' own (short) timeouts.
   await refreshEnvCapabilities();
+
+  // Register every editable prompt's built-in default so a prompt editor can
+  // list + reset each one (overrides persist in ~/.comfyui-mcp/panel-prompts.json).
+  // The persona is live-applied here; the other prompts are read fresh at each
+  // session/turn, so they take effect on the next spawn without an explicit push.
+  registerPrompt("panel.persona", "Panel agent persona (all backends)", PANEL_SYSTEM_APPEND, "Injected into every backend; applies live to running agents.");
+  registerPrompt("backend.ollama", "Ollama / OpenRouter base prompt", OLLAMA_SYSTEM_PROMPT, "Applies on the next local/OpenRouter session.");
+  registerPrompt("proposer.modelCard", "Model Explorer “Ask AI” curator", MODEL_CARD_SYSTEM, "Applies to the next Ask-AI proposal.");
+  onPromptsChanged(() => { void refreshEnvCapabilities(); });
 
   // Render watchdog: a passive WS to ComfyUI that tracks live run progress so we
   // can warn the agent about a stalled render or a queue backlog it can't see
@@ -1162,13 +1217,37 @@ export async function runPanelOrchestrator(): Promise<void> {
   {
     const panelMcpPort = Number(process.env.COMFYUI_MCP_PANEL_MCP_PORT) || bridgePort + 1;
     try {
-      panelMcpHttp = await startPanelMcpHttpServer(bridge, panelMcpPort);
+      panelMcpHttp = await startPanelMcpHttpServer(bridge, panelMcpPort, "127.0.0.1", workflowTargets);
     } catch (err) {
       logger.error(
         `[panel-orchestrator] could not start the panel HTTP MCP on :${panelMcpPort} — codex/gemini tabs will lack live-graph tools: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
+
+  // Loopback MCP console (control plane): OAuth, MCP mappings, service lifecycle.
+  // Default port bridge+3 (9180→9183). NOT +2: bridge+2 is the phone-pairing
+  // listener's port (see pairPort above), and the fork this console was ported
+  // from predates pairing — on Windows both binds accidentally coexist
+  // (specific 127.0.0.1 vs wildcard 0.0.0.0), on Linux whichever comes second
+  // dies with EADDRINUSE. The panel never hardcodes this port — it uses the
+  // console_url advertised on the `backends` frame.
+  let panelConsoleHttp: PanelConsoleHttpServer | null = null;
+  const consolePort = Number(process.env.COMFYUI_MCP_CONSOLE_PORT) || bridgePort + 3;
+  const consoleToken = randomBytes(24).toString("hex");
+  try {
+    panelConsoleHttp = await startPanelConsoleHttpServer({
+      port: consolePort,
+      bridgePort,
+      comfyuiUrl,
+      token: consoleToken,
+    });
+  } catch (err) {
+    logger.warn(
+      `[panel-orchestrator] could not start MCP console on :${consolePort}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  const consoleUrl = panelConsoleHttp?.url ?? `http://127.0.0.1:${consolePort}`;
 
   // Shared MCP server config for BOTH the Codex and Gemini backends — they take an
   // identical { transport } spec (the headless comfyui stdio MCP + the panel HTTP
@@ -1209,6 +1288,15 @@ export async function runPanelOrchestrator(): Promise<void> {
       return new GeminiBackend({
         cwd: comfyuiPath ?? process.cwd(),
         model: geminiModel,
+        systemAppend: panelSystemAppend,
+        comfyuiUrl,
+        mcpServers: makeHttpBackendMcpServers(panelTabId),
+      });
+    }
+    if (backend === "grok") {
+      return new GrokBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        model: grokModel,
         systemAppend: panelSystemAppend,
         comfyuiUrl,
         mcpServers: makeHttpBackendMcpServers(panelTabId),
@@ -1264,11 +1352,51 @@ export async function runPanelOrchestrator(): Promise<void> {
         ...customDeps(),
       });
     }
+    if (backend === "chatgpt") {
+      return new ChatGptOAuthBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        model: chatgptModel,
+        systemAppend: panelSystemAppend,
+        comfyuiUrl,
+        mcpServers: makeHttpBackendMcpServers(panelTabId),
+      });
+    }
+    if (backend === "glm") {
+      return new GlmBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        model: glmModel,
+        systemAppend: panelSystemAppend,
+        comfyuiUrl,
+        mcpServers: makeHttpBackendMcpServers(panelTabId),
+      });
+    }
+    if (backend === "kimi") {
+      return new KimiBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        model: kimiModel,
+        systemAppend: panelSystemAppend,
+        comfyuiUrl,
+        mcpServers: makeHttpBackendMcpServers(panelTabId),
+      });
+    }
+    if (backend === "copilot") {
+      // EXPERIMENTAL (ToS risk) — prepare() throws a clear re-sign-in error if
+      // no ~/.comfyui-mcp/copilot-auth.json exists yet (resolveCopilotOAuth),
+      // so simply being selectable here does not make it USABLE without the
+      // panel's experimental opt-in sign-in flow having already run.
+      return new CopilotBackend({
+        cwd: comfyuiPath ?? process.cwd(),
+        model: copilotModel,
+        systemAppend: panelSystemAppend,
+        comfyuiUrl,
+        mcpServers: makeHttpBackendMcpServers(panelTabId),
+      });
+    }
     return undefined; // claude → built-in ClaudeBackend
   };
   logger.info(
     `[panel-orchestrator] single-port multi-provider: default backend=${defaultBackend}; ` +
-      `codex/gemini panel_* live-graph tools via loopback HTTP MCP${panelMcpHttp ? ` on :${panelMcpHttp.port}` : " UNAVAILABLE"} + headless comfyui MCP`,
+      `codex/gemini/grok panel_* live-graph tools via loopback HTTP MCP${panelMcpHttp ? ` on :${panelMcpHttp.port}` : " UNAVAILABLE"} + headless comfyui MCP`,
   );
   // Readiness/model probing routes through the SELECTED backend PER TAB — a
   // codex/gemini tab's "ready" must NOT depend on Claude SDK/login health. Claude
@@ -1283,17 +1411,27 @@ export async function runPanelOrchestrator(): Promise<void> {
       pb =
         backend === "codex"
           ? new CodexBackend({ cwd: comfyuiPath ?? process.cwd(), model: codexModel })
+          : backend === "chatgpt"
+            ? new ChatGptOAuthBackend({ cwd: comfyuiPath ?? process.cwd(), model: chatgptModel })
+          : backend === "glm"
+            ? new GlmBackend({ cwd: comfyuiPath ?? process.cwd(), model: glmModel })
+          : backend === "kimi"
+            ? new KimiBackend({ cwd: comfyuiPath ?? process.cwd(), model: kimiModel })
           : backend === "ollama"
             ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: ollamaModel, ...ollamaDeps() })
-            : backend === "openrouter"
-              ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: openrouterModel, ...openrouterDeps() })
-              : backend === "lmstudio"
-                ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: lmstudioModel, ...lmstudioDeps() })
-                : backend === "llamacpp"
-                  ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: llamacppModel, ...llamacppDeps() })
-                  : backend === "custom"
-                    ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: customModel, ...customDeps() })
-                    : new GeminiBackend({ cwd: comfyuiPath ?? process.cwd(), model: geminiModel });
+            : backend === "grok"
+              ? new GrokBackend({ cwd: comfyuiPath ?? process.cwd(), model: grokModel })
+              : backend === "openrouter"
+                ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: openrouterModel, ...openrouterDeps() })
+                : backend === "lmstudio"
+                  ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: lmstudioModel, ...lmstudioDeps() })
+                  : backend === "llamacpp"
+                    ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: llamacppModel, ...llamacppDeps() })
+                    : backend === "custom"
+                      ? new OllamaBackend({ cwd: comfyuiPath ?? process.cwd(), model: customModel, ...customDeps() })
+                      : backend === "copilot"
+                        ? new CopilotBackend({ cwd: comfyuiPath ?? process.cwd(), model: copilotModel })
+                        : new GeminiBackend({ cwd: comfyuiPath ?? process.cwd(), model: geminiModel });
       probeBackends.set(backend, pb);
     }
     return pb;
@@ -1336,7 +1474,9 @@ export async function runPanelOrchestrator(): Promise<void> {
     // canvas through the loopback HTTP MCP instead). Bound to the PANEL tab so
     // panel_* tools reach the user's canvas regardless of the composite key.
     makePanelServer: (key) =>
-      backendOf(key) === "claude" ? createPanelMcpServer(bridge, panelTabOf(key)) : undefined,
+      backendOf(key) === "claude"
+        ? createPanelMcpServer(bridge, panelTabOf(key), workflowTargets)
+        : undefined,
     mcpServers: buildMcpServers(),
     // NOTE: manager callbacks fire with the composite agent key `tabId::backend`;
     // panelTabOf() recovers the PANEL tab so every push reaches the right socket.
@@ -1636,11 +1776,16 @@ export async function runPanelOrchestrator(): Promise<void> {
   function currentModelFor(backend: string): string | undefined {
     if (backend === "codex") return codexModel;
     if (backend === "gemini") return geminiModel;
+    if (backend === "grok") return grokModel;
     if (backend === "ollama") return ollamaModel;
     if (backend === "openrouter") return openrouterModel;
     if (backend === "lmstudio") return lmstudioModel || undefined;
     if (backend === "llamacpp") return llamacppModel || undefined;
     if (backend === "custom") return customModel || undefined;
+    if (backend === "chatgpt") return chatgptModel;
+    if (backend === "glm") return glmModel;
+    if (backend === "kimi") return kimiModel;
+    if (backend === "copilot") return copilotModel;
     return model;
   }
   function pushModels(panelTabId: string): void {
@@ -1700,7 +1845,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       const { backends, any_ready } = allBackendReadiness(KNOWN_BACKENDS, {
         customEndpointConfigured: !!customBaseUrl,
       });
-      bridge.push({ type: "backends", backends, any_ready }, tabId);
+      bridge.push({ type: "backends", backends, any_ready, console_url: consoleUrl, console_token: consoleToken }, tabId);
       // llama.cpp reality check (async re-push): the binary is often unzipped
       // anywhere (not on PATH), so static detection says "not installed" while
       // a server is HAPPILY ANSWERING. A live endpoint beats a missing binary —
@@ -1715,7 +1860,7 @@ export async function runPanelOrchestrator(): Promise<void> {
             lc.cli = true;
             lc.auth = true;
             lc.ready = true;
-            bridge.push({ type: "backends", backends, any_ready: true }, tabId);
+            bridge.push({ type: "backends", backends, any_ready: true, console_url: consoleUrl, console_token: consoleToken }, tabId);
           })
           .catch(() => {});
       }
@@ -1778,6 +1923,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       // switcher stops falsely showing "CLI not installed" behind a remote pod.
       pushReadiness(panelTab);
       if (backend === "claude") pushCommands(panelTab);
+      bridge.push({ type: "workflow_target", target: workflowTargets.get(panelTab) }, panelTab);
       // Re-push the last usage so the context meter isn't blank after a reload.
       const lastStatus = manager.lastStatusFor(key);
       if (lastStatus) pushStatus(panelTab, lastStatus);
@@ -1785,12 +1931,17 @@ export async function runPanelOrchestrator(): Promise<void> {
       if (now - (lastAckAt.get(panelTab) ?? 0) < ACK_DEBOUNCE_MS) return;
       lastAckAt.set(panelTab, now);
       const isCx = backend === "codex";
+      const isCg = backend === "chatgpt";
       const isGm = backend === "gemini";
+      const isGk = backend === "grok";
+      const isGl = backend === "glm";
+      const isKm = backend === "kimi";
       const isOl = backend === "ollama";
       const isOr = backend === "openrouter";
       const isLs = backend === "lmstudio";
       const isLc = backend === "llamacpp";
       const isCu = backend === "custom";
+      const isCp = backend === "copilot";
       // TRUTHFUL "connected": only claim ready after PROVING the SELECTED backend
       // can run, by probing its model list. If the probe fails — the "connected
       // but dead" wedge — send a degraded ack so the panel shows the real state.
@@ -1836,8 +1987,16 @@ export async function runPanelOrchestrator(): Promise<void> {
           if (models.length) {
             const agentLabel = isCx
               ? (codexModel ?? (models[0] as { value?: string }).value ?? "Codex")
+              : isCg
+                ? (chatgptModel ?? (models[0] as { value?: string }).value ?? "ChatGPT")
               : isGm
                 ? (geminiModel ?? (models[0] as { value?: string }).value ?? "Gemini")
+                : isGk
+                  ? (grokModel ?? (models[0] as { value?: string }).value ?? "Grok")
+                : isGl
+                  ? (glmModel ?? (models[0] as { value?: string }).value ?? "GLM")
+                : isKm
+                  ? (kimiModel ?? (models[0] as { value?: string }).value ?? "Kimi")
                 : isOl
                   ? (ollamaModel ?? (models[0] as { value?: string }).value ?? "Ollama")
                   : isLs
@@ -1848,7 +2007,9 @@ export async function runPanelOrchestrator(): Promise<void> {
                         ? (customModel || ((models[0] as { value?: string }).value ?? "Custom endpoint"))
                         : isOr
                       ? (openrouterModel ?? (models[0] as { value?: string }).value ?? "OpenRouter")
-                      : model;
+                      : isCp
+                        ? (copilotModel ?? (models[0] as { value?: string }).value ?? "Copilot")
+                        : model;
             // llama.cpp launch gotchas (issue #161): a reachable server can still
             // be useless for us — tool calling needs --jinja (rejected requests),
             // and a launch-time -c under ~16K silently truncates the tool payload.
@@ -1886,8 +2047,16 @@ export async function runPanelOrchestrator(): Promise<void> {
             if (!resume) {
               const readyText = isCx
                 ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Codex (ChatGPT) account. Ask away.`
+                : isCg
+                  ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your ChatGPT subscription (direct OAuth). Ask away.`
                 : isGm
                   ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Google account (Gemini Code Assist). Ask away.`
+                  : isGk
+                    ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Grok (xAI) account. Ask away.`
+                  : isGl
+                    ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Z.AI GLM Coding Plan. Ask away.`
+                  : isKm
+                    ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your Kimi Code subscription. Ask away.`
                   : isOl
                     ? `🟢 comfyui-mcp agent ready — ${agentLabel} running locally via Ollama (no account, no API key). Small local models are slower and simpler than frontier ones — expect fewer frills. Ask away.`
                     : isLs
@@ -1898,16 +2067,26 @@ export async function runPanelOrchestrator(): Promise<void> {
                           ? `🟢 comfyui-mcp agent ready — ${agentLabel} via your custom endpoint (${customBaseUrl}). Ask away.`
                           : isOr
                       ? `🟢 comfyui-mcp agent ready — ${agentLabel} via OpenRouter (hosted API, your OPENROUTER_API_KEY). Ask away.`
+                      : isCp
+                        ? `🟢 comfyui-mcp agent ready — ${agentLabel} on your GitHub Copilot subscription (⚠️ experimental, ToS risk — you opted in). Ask away.`
                       : `🟢 comfyui-mcp agent ready — ${agentLabel} on your Claude subscription. Ask away.`;
               bridge.push({ type: "say", text: readyText }, panelTab);
             }
             bridge.push({ type: "ack", ok: true, kind: "ready", agent: agentLabel, backend }, panelTab);
-            logger.info(`[panel-orchestrator] tab ${panelTab.slice(0, 8)} connected (${backend}) — agent healthy, ready ack`);
+            logger.debug(`[panel-orchestrator] tab ${panelTab.slice(0, 8)} connected (${backend}) — agent healthy, ready ack`);
           } else {
             const degradedText = isCx
               ? "⚠️ The background agent isn't responding — the Codex app-server couldn't start. Make sure Codex is installed and signed in (run `codex login`), then Disconnect → Connect to retry."
+              : isCg
+                ? "⚠️ The background agent isn't responding — ChatGPT direct OAuth couldn't start. Make sure ~/.codex/auth.json exists (run `codex login`), then Disconnect → Connect to retry."
               : isGm
                 ? "⚠️ The background agent isn't responding — the Gemini CLI couldn't start. Make sure the Gemini CLI is installed and signed in (run `gemini` once and complete the Google sign-in), then Disconnect → Connect to retry."
+                : isGk
+                  ? "⚠️ The background agent isn't responding — the Grok CLI couldn't start. Make sure Grok is installed and signed in (run `grok` once and complete the xAI sign-in), then Disconnect → Connect to retry."
+                : isGl
+                  ? "⚠️ The background agent isn't responding — GLM Code API couldn't start. Set ZAI_API_KEY (Z.AI Coding Plan), then Disconnect → Connect to retry."
+                : isKm
+                  ? "⚠️ The background agent isn't responding — Kimi Code couldn't start. Run Kimi Code login (~/.kimi/credentials/kimi-code.json) or set KIMI_API_KEY, then Disconnect → Connect to retry."
                 : isOl
                   ? "⚠️ The background agent isn't responding — Ollama isn't reachable. Start it with `ollama serve` and pull our fine-tuned model (`ollama pull artokun/gemma4-comfyui-mcp:e4b` — gemma4 trained on the comfyui-mcp tool suite — arena-best local model; `:12b` for ~8 GB VRAM), then Disconnect → Connect to retry."
                   : isLs
@@ -1916,6 +2095,8 @@ export async function runPanelOrchestrator(): Promise<void> {
                       ? `⚠️ The background agent isn't responding — llama-server isn't reachable at ${LLAMACPP_BASE_URL}. Start it with \`llama-server -m <model>.gguf -c 16384\` (our gemma4-comfyui-mcp GGUFs work great; add --jinja on older builds — required there for tool calling), or set COMFYUI_MCP_LLAMACPP_HOST — then Disconnect → Connect to retry.`
                       : isCu
                         ? `⚠️ The background agent isn't responding — your custom endpoint isn't answering at ${customBaseUrl}. Check the base URL in Settings → Custom endpoint (it must be OpenAI-compatible and include the /v1) and the API key if the server requires one — then Connect to retry.`
+                        : isCp
+                          ? "⚠️ The background agent isn't responding — GitHub Copilot (experimental) couldn't start. Sign in from the panel's experimental row, then Disconnect → Connect to retry."
                         : "⚠️ The background agent isn't responding — the Claude Agent SDK couldn't start. Make sure you're signed in (run `claude` once), then Disconnect → Connect to retry.";
             bridge.push({ type: "say", text: degradedText }, panelTab);
             bridge.push({ type: "ack", ok: false, kind: "degraded" }, panelTab);
@@ -1965,6 +2146,41 @@ export async function runPanelOrchestrator(): Promise<void> {
       logger.info(`[panel-orchestrator] tab ${panelTab.slice(0, 8)} switched backend ${prev} → ${reqBackend}`);
       return;
     }
+    // Workflow target picker: pin agent edits to a specific open workflow tab.
+    if (event.type === "set_workflow_target" && event.tab_id) {
+      const panelTab = event.tab_id;
+      const mode = (event as { mode?: unknown }).mode;
+      const path =
+        typeof (event as { path?: unknown }).path === "string"
+          ? String((event as { path?: unknown }).path)
+          : undefined;
+      const filename =
+        typeof (event as { filename?: unknown }).filename === "string"
+          ? String((event as { filename?: unknown }).filename)
+          : undefined;
+      if (mode !== "current" && mode !== "pinned") {
+        bridge.push(
+          { type: "ack", ok: false, kind: "workflow_target", message: "mode must be 'current' or 'pinned'" },
+          panelTab,
+        );
+        return;
+      }
+      if (mode === "pinned" && !(path ?? "").trim()) {
+        bridge.push(
+          { type: "ack", ok: false, kind: "workflow_target", message: "path required when pinning" },
+          panelTab,
+        );
+        return;
+      }
+      const target = workflowTargets.set(panelTab, { mode, path, filename });
+      bridge.push({ type: "ack", ok: true, kind: "workflow_target", target }, panelTab);
+      bridge.push({ type: "workflow_target", target }, panelTab);
+      logger.info(
+        `[panel-orchestrator] tab ${panelTab.slice(0, 8)} workflow target → ${target.mode}${target.path ? ` (${target.path})` : ""}`,
+      );
+      return;
+    }
+
     // Live panel config: render-stall threshold, plus the user's agent-model
     // preferences (preferred_models list + ollama endpoint config), persisted to
     // ~/.comfyui-mcp/panel-settings.json. Sent by the panel on connect and
@@ -1973,10 +2189,14 @@ export async function runPanelOrchestrator(): Promise<void> {
     // live ollama sessions keep their connection until restarted.
     if (event.type === "set_config" && event.tab_id) {
       if ("stall_seconds" in event) {
+        const _prevStall = liveStallSeconds;
         setLiveStallSeconds((event as { stall_seconds?: unknown }).stall_seconds);
-        logger.info(
-          `[panel-orchestrator] live stall threshold → ${liveStallSeconds ?? "default"}s`,
-        );
+        // The panel re-sends set_config on every heartbeat; only log an ACTUAL change.
+        if (liveStallSeconds !== _prevStall) {
+          logger.info(
+            `[panel-orchestrator] live stall threshold → ${liveStallSeconds ?? "default"}s`,
+          );
+        }
       }
       const cfg = event as { preferred_models?: unknown; ollama?: unknown };
       let ollamaChanged = false;
@@ -2195,6 +2415,78 @@ export async function runPanelOrchestrator(): Promise<void> {
           tabId,
         );
       });
+      return;
+    }
+
+    // In-panel OAuth sign-in: kick a loopback (codex/grok) or device-code
+    // (copilot, experimental) flow. Reply comes back FAST (loopback: just
+    // "browser opened"; device: the user_code to show) — the actual sign-in
+    // completes in the background and pushes a refreshed `{type:"backends"}`
+    // frame via pushReadiness when it lands. STATUS ONLY ever crosses the
+    // bridge here — no token material (see oauth-bridge.ts).
+    if (event.type === "oauth_begin" && event.tab_id) {
+      const tabId = event.tab_id;
+      const provider = typeof (event as { provider?: unknown }).provider === "string"
+        ? (event as { provider?: string }).provider
+        : undefined;
+      const allowExperimental = (event as { allow_experimental?: unknown }).allow_experimental === true;
+      handleOAuthBegin(
+        { provider, allow_experimental: allowExperimental },
+        {
+          onAuthChanged: () => pushReadiness(tabId),
+          onBackgroundError: (providerId, message) => {
+            const label = OAUTH_PROVIDERS[providerId]?.label ?? providerId;
+            bridge.push({ type: "say", text: `⚠️ ${label} sign-in failed: ${message}` }, tabId);
+          },
+        },
+      )
+        .then((result) => {
+          bridge.push({ type: "ack", ok: true, kind: "oauth_begin", ...result }, tabId);
+          logger.info(`[panel-orchestrator] tab ${tabId.slice(0, 8)} oauth_begin ${provider} → ${result.mode}`);
+        })
+        .catch((err) => {
+          const message = err instanceof Error ? err.message : String(err);
+          // Echo the requested provider on the failure ack too, so the panel
+          // routes the error to the row that asked (correlation) rather than
+          // guessing "last-clicked". provider may be undefined for a malformed
+          // request; the panel falls back to single-pending in that case.
+          bridge.push({ type: "ack", ok: false, kind: "oauth_begin", ...(provider ? { provider } : {}), message }, tabId);
+          logger.warn(`[panel-orchestrator] tab ${tabId.slice(0, 8)} oauth_begin ${provider ?? "?"} refused: ${message}`);
+        });
+      return;
+    }
+
+    // In-panel OAuth status: the panel's Connections tab polls this to show
+    // "signed in as …" per provider. Status-only mirror — never tokens.
+    if (event.type === "oauth_status" && event.tab_id) {
+      const tabId = event.tab_id;
+      try {
+        const result = handleOAuthStatus({});
+        bridge.push({ type: "ack", ok: true, kind: "oauth_status", ...result }, tabId);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        bridge.push({ type: "ack", ok: false, kind: "oauth_status", message }, tabId);
+      }
+      return;
+    }
+
+    // In-panel OAuth sign-out: clears the native token file + status mirror,
+    // then pushes refreshed readiness so the provider picker reflects it live.
+    if (event.type === "oauth_signout" && event.tab_id) {
+      const tabId = event.tab_id;
+      const provider = typeof (event as { provider?: unknown }).provider === "string"
+        ? (event as { provider?: string }).provider
+        : undefined;
+      try {
+        const result = handleOAuthSignout({ provider });
+        pushReadiness(tabId);
+        bridge.push({ type: "ack", kind: "oauth_signout", ...result }, tabId);
+        logger.info(`[panel-orchestrator] tab ${tabId.slice(0, 8)} oauth_signout ${provider}`);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        // Echo provider on failure too (correlation) — see oauth_begin above.
+        bridge.push({ type: "ack", ok: false, kind: "oauth_signout", ...(provider ? { provider } : {}), message }, tabId);
+      }
       return;
     }
 
@@ -2641,7 +2933,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       ? " — no local ComfyUI install found (COMFYUI_PATH unset, auto-detect came up empty); node/model installs still run via ComfyUI-Manager"
       : " — remote target: installs/downloads run ON the ComfyUI host via its Manager (a local path would be the wrong filesystem; only local-FS tools like verify_custom_node are unavailable)";
   logger.info(
-    `[panel-orchestrator] ready — bridge on ws://127.0.0.1:${bridgePort}; an agent spawns per ComfyUI tab on its first message (model=${model}, comfyui=${comfyuiUrl}${pathNote})`,
+    `[panel-orchestrator] ready — bridge on ws://127.0.0.1:${bridgePort}, console on ${consoleUrl}; an agent spawns per ComfyUI tab on its first message (model=${model}, comfyui=${comfyuiUrl}${pathNote})`,
   );
 
   let shuttingDown = false;
@@ -2661,6 +2953,7 @@ export async function runPanelOrchestrator(): Promise<void> {
     }
     // Tear down the loopback panel HTTP MCP (codex/gemini mode only).
     if (panelMcpHttp) await panelMcpHttp.stop().catch(() => {});
+    if (panelConsoleHttp) await panelConsoleHttp.stop().catch(() => {});
     secureBridge?.stop();
     await bridge.stop();
     // Only remove the lockfile if it still names us — avoid clobbering a fresh

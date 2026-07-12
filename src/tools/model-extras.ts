@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { unlink, writeFile } from "node:fs/promises";
-import { isLocalMode } from "../config.js";
+import { isLocalMode, config } from "../config.js";
 import { logger } from "../utils/logger.js";
 import {
   downloadModel,
@@ -12,6 +12,7 @@ import {
   resolveCivitaiModel,
   resolveCivitaiModelVersion,
   buildCivitaiMarkdown,
+  searchCivitaiModels,
   type CivitaiMetadata,
 } from "../services/civitai-resolver.js";
 import { ValidationError, errorToToolResult } from "../utils/errors.js";
@@ -103,6 +104,95 @@ export function registerModelExtrasTools(server: McpServer): void {
   );
 
   server.tool(
+    "search_civitai_models",
+    "Search CivitAI by keyword for checkpoints, LoRAs, embeddings, VAEs, and ControlNets — THE tool for " +
+      "'find me a <base model> LoRA on Civitai'. Read-only and network-only (public CivitAI REST API; no " +
+      "token or running ComfyUI required; CIVITAI_API_TOKEN unlocks gated results). Filter by `types` " +
+      "(LORA, Checkpoint, TextualInversion, VAE, Controlnet, …) and `base_models` (CivitAI labels: " +
+      "'Flux.1 D', 'SDXL 1.0', 'SD 1.5', 'Pony', 'Illustrious', 'Wan Video') — ALWAYS pass base_models when " +
+      "the user's checkpoint family is known, so results actually fit their setup. Each hit returns the " +
+      "model_id and version_id that download_civitai_model takes directly, plus trigger words to use in the " +
+      "prompt after installing. Flow: search_civitai_models → pick a hit → download_civitai_model " +
+      "{model_version_id, target_subfolder} → wire/prompt with the trained words. SFW-only by default. " +
+      "For HuggingFace search use search_models.",
+    {
+      query: z.string().min(1).describe("Keyword search (e.g. 'detail enhancer', 'anime style', a character name)"),
+      types: z
+        .array(z.enum(["Checkpoint", "LORA", "LoCon", "DoRA", "TextualInversion", "VAE", "Controlnet", "Upscaler", "MotionModule", "Workflows"]))
+        .optional()
+        .describe("Only these model types (e.g. ['LORA'])."),
+      base_models: z
+        .array(z.string())
+        .optional()
+        .describe("Only these base-model families, CivitAI labels: 'Flux.1 D', 'SDXL 1.0', 'SD 1.5', 'Pony', 'Illustrious', 'Wan Video', …"),
+      sort: z
+        .enum(["Highest Rated", "Most Downloaded", "Newest"])
+        .optional()
+        .describe("Ranking (default 'Highest Rated')."),
+      nsfw: z.boolean().optional().describe("Include NSFW results (default false)."),
+      limit: z.number().int().min(1).max(25).optional().describe("Max results (default 10)."),
+    },
+    async (args) => {
+      try {
+        const hits = await searchCivitaiModels(args.query, {
+          types: args.types,
+          baseModels: args.base_models,
+          sort: args.sort,
+          nsfw: args.nsfw,
+          limit: args.limit,
+        });
+        if (hits.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `No CivitAI models matched "${args.query}"` +
+                  (args.base_models?.length ? ` for base ${args.base_models.join("/")}` : "") +
+                  `. Try a broader query, drop the filters, or search HuggingFace with search_models.`,
+              },
+            ],
+          };
+        }
+        const lines = hits.map((h, i) => {
+          const stats = [
+            h.base_model && `base ${h.base_model}`,
+            h.downloads != null && `${h.downloads.toLocaleString()} downloads`,
+            h.thumbs_up != null && `${h.thumbs_up} 👍`,
+            h.size_mb && `~${h.size_mb} MB`,
+            h.nsfw && "NSFW",
+          ]
+            .filter(Boolean)
+            .join(" · ");
+          const words = h.trained_words?.length ? `\n   trigger words: ${h.trained_words.join(", ")}` : "";
+          return (
+            `${i + 1}. **${h.name}** (${h.type ?? "?"}) by ${h.creator ?? "unknown"} — ${stats}\n` +
+            `   model_id: ${h.model_id} · model_version_id: ${h.version_id ?? "?"} (${h.version_name ?? "latest"})${words}`
+          );
+        });
+        // Civitai downloads are token-gated even though search is open — warn
+        // BEFORE the model burns rounds on 401s (live E2E failure shape).
+        const tokenNote = config.civitaiApiToken
+          ? ""
+          : `\nNOTE: no CIVITAI_API_TOKEN is configured — downloads WILL fail with 401 until the user sets one (panel Settings › “Set CivitAI token…”, or the CIVITAI_API_TOKEN env var; created at civitai.com/user/account). Ask them to set it before attempting a download.`;
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `${hits.length} CivitAI result(s) for "${args.query}":\n\n${lines.join("\n\n")}\n\n` +
+                `Next: download_civitai_model {"model_version_id": <id>, "target_subfolder": "<loras|checkpoints|...>"} — then use the trigger words in the prompt.` +
+                tokenNote,
+            },
+          ],
+        };
+      } catch (err) {
+        return errorToToolResult(err);
+      }
+    },
+  );
+
+  server.tool(
     "download_civitai_model",
     "Download a model from CivitAI into the connected ComfyUI's models/ directory. " +
       "Resolves a CivitAI model id (latest version) or a model-version id to a download " +
@@ -179,6 +269,38 @@ export function registerModelExtrasTools(server: McpServer): void {
         ];
         if (resolved.modelName) lines.push(`  Model: ${resolved.modelName}`);
         lines.push(`  Version id: ${resolved.versionId}`);
+        // NOT-A-MODEL guard (live panel finding: the agent downloaded a
+        // 'Workflows'-type zip into loras/ and told the user their LoRA was
+        // installed). Loud warning when the entry type / file extension can't
+        // load as a model so the agent corrects course instead of celebrating.
+        const civitaiType = resolved.metadata?.modelType;
+        const NON_MODEL_TYPES = new Set(["Workflows", "Poses", "Wildcards", "Other"]);
+        const fileExt = (filename ?? savedPath).toLowerCase().match(/\.([a-z0-9]+)$/)?.[1];
+        const NON_MODEL_EXTS = new Set(["zip", "rar", "7z", "json", "txt", "png", "jpg"]);
+        if ((civitaiType && NON_MODEL_TYPES.has(civitaiType)) || (fileExt && NON_MODEL_EXTS.has(fileExt))) {
+          lines.push(
+            `  WARNING: this CivitAI entry is type "${civitaiType ?? "unknown"}" (file: .${fileExt ?? "?"}) — it is NOT a loadable model file and will not appear in a ${args.target_subfolder} loader. ` +
+              `If the user wanted a LoRA/checkpoint, re-run search_civitai_models with types:["LORA"] (or ["Checkpoint"]) and download a hit whose type matches. Do not tell the user a model was installed.`,
+          );
+        }
+
+        // Write usage-docs sidecars beside the file so the panel agent has the
+        // description, trigger words, and example generation params on hand.
+        // Local-only: remote mode has no local FS (savedPath is a status string).
+        if (isLocalMode() && resolved.metadata) {
+          const sidecar = await writeCivitaiSidecar(savedPath, resolved.metadata);
+          if (sidecar) {
+            const tw = resolved.metadata.trainedWords;
+            if (tw.length) lines.push(`  Trigger words: ${tw.join(", ")}`);
+            const recipes = resolved.metadata.examples.filter(
+              (e) => e.meta && Object.keys(e.meta).length > 0,
+            ).length;
+            lines.push(
+              `  Metadata: ${sidecar.md}` +
+                (recipes ? ` (${recipes} example recipe${recipes === 1 ? "" : "s"})` : ""),
+            );
+          }
+        }
 
         // Write usage-docs sidecars beside the file so the panel agent has the
         // description, trigger words, and example generation params on hand.

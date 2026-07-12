@@ -33,6 +33,10 @@ import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { UiBridge } from "../services/ui-bridge.js";
 import {
+  type WorkflowTargetStore,
+  withWorkflowTarget,
+} from "../services/workflow-target-store.js";
+import {
   addUserMcpServer,
   readUserMcpServers,
   removeUserMcpServer,
@@ -44,6 +48,7 @@ import { QueueMonitor } from "../services/queue-monitor.js";
 import { getObjectInfo, backfillObjectInfo } from "../comfyui/client.js";
 import { convertUiToApi, collectNodeTypes } from "../services/workflow-converter.js";
 import { sliceWorkflow } from "../services/workflow-slicer.js";
+import { validateA2UISpecServer } from "../services/a2ui-spec.js";
 import type { UiWorkflow } from "../comfyui/types.js";
 
 /** Treat these as an affirmative answer to the adult-content consent card. */
@@ -233,13 +238,21 @@ export interface PanelToolCtx {
    *  (image screenshots, secret collection). */
   bridge: UiBridge;
   tabId: string;
+  /** Per-tab workflow pin store (optional for tests). */
+  workflowTarget?: WorkflowTargetStore;
 }
 
 /** Build a tab-bound execution context shared by both transports. */
-export function makePanelToolCtx(bridge: UiBridge, tabId: string): PanelToolCtx {
+export function makePanelToolCtx(
+  bridge: UiBridge,
+  tabId: string,
+  workflowTargets?: WorkflowTargetStore,
+): PanelToolCtx {
   const call = async (cmd: Record<string, unknown>, timeoutMs?: number): Promise<ToolResult> => {
     try {
-      return ok(await bridge.send(cmd as { cmd: string }, { tabId, timeoutMs }));
+      const target = workflowTargets?.get(tabId);
+      const routed = target ? withWorkflowTarget(cmd, target) : cmd;
+      return ok(await bridge.send(routed as { cmd: string }, { tabId, timeoutMs }));
     } catch (err) {
       return fail(err);
     }
@@ -269,7 +282,7 @@ export function makePanelToolCtx(bridge: UiBridge, tabId: string): PanelToolCtx 
       return false;
     }
   };
-  return { call, confirm, bridge, tabId };
+  return { call, confirm, bridge, tabId, workflowTarget: workflowTargets };
 }
 
 /** One shared tool definition: name, description, zod raw-shape schema, and a
@@ -365,6 +378,12 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "Read a COMPACT, dependency-ordered TEXT MAP of the workflow the user is viewing — the FASTEST way to UNDERSTAND a graph (especially a big loaded pack/template) before you touch it. Returns one `outline` string built for you to read top→down: nodes are topologically sorted (sources first, sinks last), each shown on its own block as `id Type \"title\" [bypass/mute] [OUTPUT] · group:X  widget=value …` with `← inputs` (as source_node.output_name) and `→ outputs` (as target_node.input_name), preceded by a GROUPS index (title → member node ids). It shows the WIRING you'd otherwise have to reconstruct. Use this FIRST to get oriented; then panel_query_graph to filter/traverse/inspect (e.g. {ids:[42], fields:'detail'} for one node's exact slot/widget detail), or panel_find_nodes for free-text search. Read-only.",
       {},
       async (_args, ctx) => ctx.call({ cmd: "graph_outline" }),
+    ),
+    def(
+      "panel_audit_prompt_director",
+      "Audit Prompt Director on the LIVE canvas without changing it. Correlates Prompt Director/Producer/Auto/Context/Reference/Critic widget values and wiring with detected model-loader filenames, every LoRA loader's actual model/CLIP strengths, and Prompt Director's latest sanitized runtime edit plan, resolved Model Explorer metadata, warnings, exact final prompt, and critic verdict. Returns observations plus proposed panel_set_widget changes with requires_confirmation=true. Call this when Prompt Director nodes are present, before saying the model/LoRA setup is correct, or when an edit prompt is ignored. READ-ONLY: present useful findings to the user and ask before applying any recommendation unless they already explicitly asked you to fix it.",
+      {},
+      async (_args, ctx) => ctx.call({ cmd: "graph_prompt_director_audit" }),
     ),
     def(
       "panel_get_subgraph",
@@ -648,14 +667,24 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           .boolean()
           .optional()
           .describe("Default true. Set false to force legacy exact resolution (omitted slot = index 0)."),
+        // ALIASES small models actually emit (live panel finding): zod silently
+        // STRIPPED from_slot_name/to_slot_name, both slots fell to "auto", and
+        // auto-match wired something the model never asked for — reported as
+        // success, scrambling the graph. Accept the aliases so intent survives.
+        from_slot_name: slotRef.optional().describe("Alias for from_output."),
+        to_slot_name: slotRef.optional().describe("Alias for to_input."),
+        from_slot: slotRef.optional().describe("Alias for from_output."),
+        to_slot: slotRef.optional().describe("Alias for to_input."),
+        output: slotRef.optional().describe("Alias for from_output."),
+        input: slotRef.optional().describe("Alias for to_input."),
       },
       async (args: A, ctx) =>
         ctx.call({
           cmd: "graph_connect",
           from_node_id: args.from_node_id,
-          from_output: args.from_output,
+          from_output: args.from_output ?? args.from_slot_name ?? args.from_slot ?? args.output,
           to_node_id: args.to_node_id,
-          to_input: args.to_input,
+          to_input: args.to_input ?? args.to_slot_name ?? args.to_slot ?? args.input,
           auto_match: args.auto_match,
         }),
     ),
@@ -1084,6 +1113,47 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       "List the user's OPEN workflow tabs and which one is active (path, filename, modified, persisted). Use this to know what's open before switching/renaming/closing. Read-only.",
       {},
       async (_args, ctx) => ctx.call({ cmd: "workflow_list" }),
+    ),
+    def(
+      "panel_get_workflow_target",
+      "Read which workflow this agent is bound to edit. mode 'current' means graph tools follow whatever tab the user is viewing; mode 'pinned' means edits go to the pinned workflow even if the user switched to another tab. Call this when unsure which workflow your panel_* edits will affect.",
+      {},
+      async (_args, ctx) => {
+        const target = ctx.workflowTarget?.get(ctx.tabId) ?? { mode: "current" as const };
+        return ok(target);
+      },
+    ),
+    def(
+      "panel_set_workflow_target",
+      "Pin the agent to a specific open workflow tab, or release the pin to follow the user's current tab. Use pinned when the user asks you to work on workflow A while they browse workflow B — set mode:'pinned' and path from panel_list_workflows. Set mode:'current' (or omit path) to follow the active tab again. Does NOT switch what the user sees; it only routes your panel_* graph edits.",
+      {
+        mode: z
+          .enum(["current", "pinned"])
+          .describe("'current' = follow the user's active workflow tab; 'pinned' = always edit the given path."),
+        path: z
+          .string()
+          .optional()
+          .describe("Workflow path/filename/key from panel_list_workflows — required when mode is 'pinned'."),
+        filename: z.string().optional().describe("Optional display label for the pinned workflow."),
+      },
+      async (args: A, ctx) => {
+        if (!ctx.workflowTarget) {
+          return fail("Workflow targeting is not available in this session.");
+        }
+        const mode = args.mode === "pinned" ? "pinned" : "current";
+        const path = typeof args.path === "string" ? args.path : undefined;
+        const filename = typeof args.filename === "string" ? args.filename : undefined;
+        if (mode === "pinned" && !(path ?? "").trim()) {
+          return fail("Provide path when pinning — use panel_list_workflows to list open workflows.");
+        }
+        const target = ctx.workflowTarget.set(ctx.tabId, { mode, path, filename });
+        ctx.bridge.push({ type: "workflow_target", target }, ctx.tabId);
+        const hint =
+          target.mode === "pinned"
+            ? `Pinned to "${target.filename ?? target.path}". Graph tools will target that workflow without switching the user's view.`
+            : "Following the user's current workflow tab.";
+        return ok({ ...target, note: hint });
+      },
     ),
     def(
       "panel_new_workflow",
@@ -1605,6 +1675,33 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         return ctx.call({ cmd: "show_media", items: resolved }, 60000);
       },
     ),
+    def(
+      "panel_ui_render",
+      "Render an INTERACTIVE UI CARD in the panel chat from an A2UI-subset JSON spec — choice buttons, forms (TextField/Select/Checkbox + a submit Button), node-wiring diagrams (comfy:graph), and bar/line charts (comfy:chart). Use a card whenever the user must pick between options, confirm a plan, fill in parameters, or would understand a wiring explanation better as a diagram. The card is non-blocking: this returns { card_id } immediately; when the user clicks a button (or submits a form) their choice arrives as a NORMAL chat message (the button's `reply` text; submit buttons append 'name: value' lines) — so after rendering a card that asks a question, END YOUR TURN and wait. Set surface:'wide' for diagram-heavy cards (the panel widens and restores automatically). Spec shape: { surface?, title?, root: '<id>', components: [ {id, type, ...} ] } with children referenced by id. Types: Text{text}, Heading{text,level?}, Button{label,reply?,submit?,style?:'primary'|'secondary'}, Row/Column/Card{children:[ids]}, Divider, Image{src:/view-URL,caption?}, TextField{label,name,value?,placeholder?}, Select{label,name,options:[{label,value?}],value?}, Checkbox{label,name,checked?}, 'comfy:graph'{nodes:[{id,label,color?}],edges:[{from,to,label?}],direction?:'lr'|'tb'}, 'comfy:chart'{kind:'bar'|'line',series:[{label,values:[num]}],x?:[labels]}. Caps: ≤64 components, ≤30 graph nodes, ≤8×256 chart points. On a validation error, FIX the spec and retry.",
+      {
+        spec: z
+          .record(z.string(), z.unknown())
+          .describe("The A2UI-subset card spec object (see tool description for the exact shape)."),
+      },
+      async (args: A, ctx) => {
+        const v = validateA2UISpecServer(args.spec);
+        if (!v.ok) return fail(`invalid a2ui spec: ${v.errors.join("; ")}`);
+        return ctx.call({ cmd: "ui_render", spec: v.spec }, 15000);
+      },
+    ),
+    def(
+      "panel_ui_update",
+      "Re-render a LIVE card previously created with panel_ui_render, in place (progress updates, revised options, reactive forms). Pass the card_id you received and a complete NEW spec (same shape/caps as panel_ui_render — this replaces the card's content, it does not merge). Fails once the user has already clicked/resolved or dismissed the card, or after the view was switched away — on 'no live card', just render a fresh card instead.",
+      {
+        card_id: z.string().describe("The card_id returned by panel_ui_render."),
+        spec: z.record(z.string(), z.unknown()).describe("The complete replacement spec."),
+      },
+      async (args: A, ctx) => {
+        const v = validateA2UISpecServer(args.spec);
+        if (!v.ok) return fail(`invalid a2ui spec: ${v.errors.join("; ")}`);
+        return ctx.call({ cmd: "ui_update", card_id: args.card_id, spec: v.spec }, 15000);
+      },
+    ),
   ];
 }
 
@@ -1619,8 +1716,9 @@ export function buildPanelToolDefs(): PanelToolDef[] {
 export function createPanelMcpServer(
   bridge: UiBridge,
   tabId: string,
+  workflowTargets?: WorkflowTargetStore,
 ): McpSdkServerConfigWithInstance {
-  const ctx = makePanelToolCtx(bridge, tabId);
+  const ctx = makePanelToolCtx(bridge, tabId, workflowTargets);
   const defs = buildPanelToolDefs();
   // The Anthropic SDK's tool() accepts (name, description, zodRawShape, cb). The
   // shared handler is transport-agnostic — bind it to this tab's ctx. Each def's

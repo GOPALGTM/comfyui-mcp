@@ -191,6 +191,72 @@ describe("OllamaBackend", () => {
     expect(chatRequests.length).toBeLessThanOrEqual(5);
   });
 
+  it("recovers an EMPTY final after tool rounds with one summarize nudge (never loops)", async () => {
+    const { client } = fakeMcpClient(COMFY_META);
+    const backend = new OllamaBackend({ model: "artokun/gemma4-comfyui-mcp:e4b", connectToolClients: async () => ({ comfyui: client }) });
+    chatScript.push(
+      // round 0: one tool call
+      [{ message: { content: "", tool_calls: [{ function: { name: "list_tools", arguments: {} } }] }, done: true }],
+      // round 1: EMPTY final (the live-E2E quirk) → should trigger the nudge
+      [{ message: { content: "" }, done: true }],
+      // round 2: the nudged summary
+      [{ message: { content: "I found download_civitai_model — give me a model id and I'll fetch it." }, done: true }],
+    );
+    const events = await collect(backend, turnsOf({ text: "find a lora" }));
+    const assistant = events.filter((e) => e.type === "assistant") as Array<{ text: string }>;
+    expect(assistant).toHaveLength(1);
+    expect(assistant[0].text).toContain("download_civitai_model");
+    // The nudge rode the wire as a user message exactly once.
+    const nudges = chatRequests.flatMap((r) => r.messages).filter((m) => m.role === "user" && String(m.content).includes("your reply was EMPTY"));
+    expect(nudges).toHaveLength(1);
+    expect(events.filter((e) => e.type === "result")).toMatchObject([{ type: "result", ok: true }]);
+
+    // Second empty in a row → falls through (empty answer, but NO infinite nudging).
+    chatScript.push(
+      [{ message: { content: "", tool_calls: [{ function: { name: "list_tools", arguments: { search: "x" } } }] }, done: true }],
+      [{ message: { content: "" }, done: true }],
+      [{ message: { content: "" }, done: true }],
+    );
+    const backend2 = new OllamaBackend({ model: "artokun/gemma4-comfyui-mcp:e4b", connectToolClients: async () => ({ comfyui: client }) });
+    const events2 = await collect(backend2, turnsOf({ text: "find a lora" }));
+    expect(events2.filter((e) => e.type === "result")).toMatchObject([{ type: "result", ok: true }]);
+    // …but never SILENTLY: the double-empty turn still shows a fallback line
+    // (live panel test: Civitai 503 → double empty → user saw nothing at all).
+    const finals2 = events2.filter((e) => e.type === "assistant") as Array<{ text: string }>;
+    expect(finals2).toHaveLength(1);
+    expect(finals2[0].text).toContain("couldn't compose a reply");
+  });
+
+  it("breaks a DISCOVERY loop: list_tools with a different search each round (the Civitai-hunt wedge)", async () => {
+    const { client, callTool } = fakeMcpClient(COMFY_META);
+    const backend = new OllamaBackend({ model: "gemma4:e4b", connectToolClients: async () => ({ comfyui: client }) });
+    // Every round the model searches list_tools with a NEW query — the exact-
+    // repeat breaker can't see these as repeats, but the discovery counter can.
+    const search = (q: string) => [
+      { message: { content: "", tool_calls: [{ function: { name: "list_tools", arguments: { search: q } } }] }, done: true },
+    ];
+    chatScript.push(
+      search("civitai"), search("lora"), search("flux"), search("download lora"),
+      search("model search"), search("find civitai"), search("browse"), search("more"),
+    );
+    const events = await collect(backend, turnsOf({ text: "find a good Flux LoRA on Civitai and add it" }));
+    // The first 3 distinct searches dispatch; the 4th+ get the SEARCH LIMIT nudge
+    // (which names the Civitai reality) instead of another catalog dump.
+    expect(callTool).toHaveBeenCalledTimes(3);
+    const limitNudges = chatRequests
+      .flatMap((r) => r.messages)
+      .filter((m) => m.role === "tool" && String(m.content).startsWith("SEARCH LIMIT"));
+    expect(limitNudges.length).toBeGreaterThanOrEqual(1);
+    expect(String(limitNudges[0].content)).toContain("Civitai");
+    // The live panel wedge: hunting "lora loader" in the headless catalog —
+    // the nudge must point graph actions at the panel router.
+    expect(String(limitNudges[0].content)).toContain("panel_add_node");
+    // And the turn ends on the loop-breaker, not by running to max_tool_rounds.
+    expect(events.filter((e) => e.type === "result")).toEqual([
+      { type: "result", ok: false, subtype: "tool_loop" },
+    ]);
+  });
+
   it("dispatches comfyui meta-tool calls and feeds results back to the next request", async () => {
     const { client, callTool } = fakeMcpClient(COMFY_META);
     const backend = new OllamaBackend({ model: "gemma4:e4b", connectToolClients: async () => ({ comfyui: client }) });

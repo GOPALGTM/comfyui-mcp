@@ -56,7 +56,7 @@ const downloadAuthSchema = z.discriminatedUnion("type", [
 export function registerModelManagementTools(server: McpServer): void {
   server.tool(
     "search_models",
-    "Search HuggingFace Hub for models usable in ComfyUI (checkpoints, LoRAs, VAEs, ControlNets, etc.). Read-only and network-only: queries HuggingFace over HTTP, does NOT require a running ComfyUI or COMFYUI_PATH and does not download anything. Returns a ranked list with modelId, author, downloads, likes, and tags. Pick a result's download URL and pass it to download_model to install it locally. For packs of custom nodes (not models) use search_custom_nodes.",
+    "Search HuggingFace Hub for models usable in ComfyUI (checkpoints, LoRAs, VAEs, ControlNets, etc.). Read-only and network-only: queries HuggingFace over HTTP, does NOT require a running ComfyUI or COMFYUI_PATH and does not download anything. Returns a ranked list with modelId, author, downloads, likes, and tags. Pick a result's download URL and pass it to download_model to install it locally. For CIVITAI searches ('find a Flux LoRA on Civitai') use search_civitai_models instead — it filters by type + base model and returns ids for download_civitai_model. For packs of custom nodes (not models) use search_custom_nodes.",
     {
       query: z.string().describe("Search query (e.g. 'SDXL', 'flux', 'controlnet')"),
       filter: z
