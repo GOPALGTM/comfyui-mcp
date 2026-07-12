@@ -353,7 +353,39 @@ export function startPanelConsoleHttpServer(opts: {
 }): Promise<PanelConsoleHttpServer> {
   const host = opts.host ?? "127.0.0.1";
 
+  // The panel calls /api/secrets from the ComfyUI page origin (e.g.
+  // http://127.0.0.1:8188 → this console's port), which is CROSS-origin — without
+  // CORS headers the browser hard-fails the fetch ("Couldn't load credentials")
+  // even though the request itself is loopback + token-gated. Allow exactly the
+  // ComfyUI origin (plus its localhost↔127.0.0.1 twin, since the page may be
+  // open under either name). Never "*": the token would otherwise be callable
+  // from any web page the user has open.
+  const allowedOrigins = new Set<string>();
+  try {
+    const u = new URL(opts.comfyuiUrl);
+    const twins = new Set([u.hostname, u.hostname === "localhost" ? "127.0.0.1" : "localhost"]);
+    for (const h of twins) allowedOrigins.add(`${u.protocol}//${h}${u.port ? `:${u.port}` : ""}`);
+  } catch {
+    allowedOrigins.add("http://127.0.0.1:8188");
+    allowedOrigins.add("http://localhost:8188");
+  }
+
   const server: Server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    const origin = typeof req.headers.origin === "string" ? req.headers.origin : "";
+    if (origin && allowedOrigins.has(origin)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
+    }
+    if (req.method === "OPTIONS") {
+      // Preflight for the authorized JSON POST (Authorization + content-type).
+      res.writeHead(204, {
+        "Access-Control-Allow-Methods": "GET, POST",
+        "Access-Control-Allow-Headers": "authorization, content-type",
+        "Access-Control-Max-Age": "600",
+      });
+      res.end();
+      return;
+    }
     const path = (req.url ?? "/").split("?")[0];
     if (path === "/api/secrets") {
       if (!tokenOk(req, opts.token)) { sendJson(res, 401, { ok: false, error: "unauthorized" }); return; }

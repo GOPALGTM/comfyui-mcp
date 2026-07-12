@@ -84,4 +84,47 @@ describe("panel-console-http", () => {
       await srv.stop();
     }
   });
+
+  it("sends CORS headers for the ComfyUI origin (and its localhost twin) only", async () => {
+    const srv = await startPanelConsoleHttpServer({
+      port: 0,
+      bridgePort: 9180,
+      comfyuiUrl: "http://127.0.0.1:9500",
+    });
+    try {
+      // The panel page's origin: allowed.
+      const allowed = await fetch(`${srv.url}/api/secrets`, {
+        headers: { origin: "http://127.0.0.1:9500" },
+      });
+      expect(allowed.headers.get("access-control-allow-origin")).toBe("http://127.0.0.1:9500");
+
+      // localhost twin of the same origin: allowed (page may be open under either name).
+      const twin = await fetch(`${srv.url}/api/secrets`, {
+        headers: { origin: "http://localhost:9500" },
+      });
+      expect(twin.headers.get("access-control-allow-origin")).toBe("http://localhost:9500");
+
+      // Arbitrary web origin: NO CORS grant (token would otherwise be probeable
+      // from any page the user has open).
+      const denied = await fetch(`${srv.url}/api/secrets`, {
+        headers: { origin: "https://evil.example" },
+      });
+      expect(denied.headers.get("access-control-allow-origin")).toBeNull();
+
+      // Preflight for the authorized JSON POST.
+      const preflight = await fetch(`${srv.url}/api/secrets`, {
+        method: "OPTIONS",
+        headers: {
+          origin: "http://127.0.0.1:9500",
+          "access-control-request-method": "POST",
+          "access-control-request-headers": "authorization, content-type",
+        },
+      });
+      expect(preflight.status).toBe(204);
+      expect(preflight.headers.get("access-control-allow-methods")).toContain("POST");
+      expect(preflight.headers.get("access-control-allow-headers")).toContain("authorization");
+    } finally {
+      await srv.stop();
+    }
+  });
 });
