@@ -6,6 +6,44 @@ All notable changes to this project are documented here. This project adheres to
 
 ## Unreleased
 
+## [0.31.0] - 2026-07-12
+
+### MCP
+
+#### Added
+- clear/revoke path for credential slots — POST {slot, clear:true} (#203)
+- forward tool_call as an 'action' frame for mobile tool visibility
+- A2UI chat cards — panel_ui_render/panel_ui_update with server-side spec wall — ported from MichaelDanCurtis fork (#194)
+- per-workflow agent sessions + prompt registry — ported from MichaelDanCurtis fork (#199)
+- OAuth engine + Grok/Kimi/GLM/ChatGPT/Copilot provider backends — ported from MichaelDanCurtis fork (#201)
+- upload_media bridge frame — stage phone media as ComfyUI input
+- loopback MCP console + credential slots — ported from MichaelDanCurtis fork (#197)
+- ltx23-distill-3stage — 3-stage LTX 2.3 distill I2V/T2V pack — from jcd315 fork (#195)
+- native search_civitai_models — kill the bundled MCP, own the loop (#198)
+- chat-history bridge frames (list_history / load_history)
+- integrate official comfy-cli JSON tools
+- download metadata sidecars + agent-visible trigger words
+- call_tool — direct, whitelisted tool channel for the mobile app
+
+#### Fixed
+- a throwing backend constructor can never kill the process (#209)
+- pick the real LAN IP, not a VPN/virtual adapter
+- forward onToolCall to spawned agents (action lines were dropped)
+- move MCP console to bridge+3 — bridge+2 is the phone-pairing listener's port
+- thread injectable home through readOAuthStatus — CLI-auth detection leaked the real homedir into readiness tests
+- loud not-a-model warning on download (Workflows-zip trap) (#206)
+- report existing CLI logins in oauth_status — no more double sign-in prompt
+- signpost graph editing to the panel router (live panel wedge #3) (#205)
+- CORS for the ComfyUI origin — the panel's credentials card couldn't fetch /api/secrets
+- panel_connect slot aliases — stop silent auto-match on stripped params (#204)
+- re-queue the in-flight message when the agent crashes mid-turn
+- a tool-using turn can never end in silence (#202)
+- community fixes — get_node_info summary, comfy-api-key fallback, save_workflow doc clarity (from community forks) (#196)
+- live-E2E follow-ups — honest stop copy + empty-final recovery (#193)
+- harden comfy-cli integration
+- stop the 'circles' loop on unsatisfiable searches (Discord report) (#191)
+
+
 ## [0.30.0] - 2026-07-09
 
 ### MCP
